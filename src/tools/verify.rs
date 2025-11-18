@@ -1,10 +1,10 @@
 use crate::model::structs::*;
+use crate::reader::pcap_iter::{BlockHandler, IterationState, PcapIterator, PcapIterError, DEFAULT_BUFFER_SIZE};
 use std::fs::{File, read_dir};
 use std::io::BufReader;
 use std::mem;
 use std::path::{Path, PathBuf};
-use pcap_parser::{PcapBlockOwned, PcapError, PcapNGReader};
-use pcap_parser::traits::PcapReaderIterator;
+use pcap_parser::PcapBlockOwned;
 
 /// Errors that can occur during solcap file verification
 #[derive(Debug)]
@@ -39,9 +39,14 @@ impl From<std::io::Error> for VerifyError {
     }
 }
 
-impl<I: std::fmt::Debug> From<PcapError<I>> for VerifyError {
-    fn from(err: PcapError<I>) -> Self {
-        VerifyError::PcapError(format!("{:?}", err))
+impl From<PcapIterError> for VerifyError {
+    fn from(err: PcapIterError) -> Self {
+        match err {
+            PcapIterError::IoError(e) => VerifyError::IoError(e),
+            PcapIterError::PcapError(e) => VerifyError::PcapError(e),
+            PcapIterError::InvalidFormat(e) => VerifyError::MalformedBlock(e, 0),
+            PcapIterError::IncompleteData(e) => VerifyError::MalformedBlock(e, 0),
+        }
     }
 }
 
@@ -217,6 +222,40 @@ fn verify_directory(dir_path: &Path, verbose: bool) -> Result<VerifyStats, Verif
     Ok(total_stats)
 }
 
+/// Block handler for verification
+struct VerifyHandler {
+    stats: VerifyStats,
+    verbose: bool,
+    epb_seen: bool,
+}
+
+impl BlockHandler for VerifyHandler {
+    type Error = VerifyError;
+
+    fn handle_block(
+        &mut self,
+        block: &PcapBlockOwned,
+        state: &mut IterationState,
+        offset: usize,
+    ) -> Result<(), Self::Error> {
+        self.stats.total_bytes += offset as u64;
+        verify_block(block, &mut self.stats, state, &mut self.epb_seen, self.verbose)
+    }
+
+    fn handle_unexpected_eof(
+        &mut self,
+        _state: &mut IterationState,
+    ) -> Result<(), Self::Error> {
+        // Unexpected EOF means the file is incomplete/corrupted
+        let msg = if self.stats.epb_count > 0 {
+            format!("Unexpected EOF after {} blocks - file is incomplete/truncated", self.stats.epb_count)
+        } else {
+            "File appears to be truncated or invalid".to_string()
+        };
+        Err(VerifyError::MalformedBlock(msg, 0))
+    }
+}
+
 /// Verify a single solcap file structure
 fn verify_file<P: AsRef<Path>>(path: P, verbose: bool) -> Result<VerifyStats, VerifyError> {
     let file = File::open(path.as_ref())?;
@@ -228,99 +267,44 @@ fn verify_file<P: AsRef<Path>>(path: P, verbose: bool) -> Result<VerifyStats, Ve
         println!("File size: {} bytes ({:.2} MB)\n", file_size, file_size as f64 / (1024.0 * 1024.0));
     }
 
-    // Create PCAP reader with 64MB buffer (same as solcap_reader)
-    let mut pcap_reader = PcapNGReader::new(64 * 1024 * 1024, buf_reader)?;
-    
-    let mut stats = VerifyStats::new();
-    let mut current_offset: u64 = 0;
-    let mut section_found = false;
-    let mut idb_found = false;
-    let mut epb_seen = false;
+    let mut iterator = PcapIterator::with_buffer_size(buf_reader, DEFAULT_BUFFER_SIZE)?;
+    let mut handler = VerifyHandler {
+        stats: VerifyStats::new(),
+        verbose,
+        epb_seen: false,
+    };
     
     if verbose {
         println!("Starting verification...\n");
     }
 
-    loop {
-        let result = pcap_reader.next();
-        match result {
-            Ok((offset, block)) => {
-                stats.total_bytes += offset as u64;
-                
-                verify_block(
-                    &block, 
-                    &mut stats, 
-                    &mut section_found, 
-                    &mut idb_found, 
-                    &mut epb_seen,
-                    current_offset,
-                    verbose
-                )?;
-                
-                current_offset += offset as u64;
-                pcap_reader.consume(offset);
-            }
-            Err(PcapError::Eof) => break,
-            Err(PcapError::Incomplete(_n)) => {
-                if let Err(e) = pcap_reader.refill() {
-                    return Err(VerifyError::PcapError(format!("Refill error: {:?}", e)));
-                }
-                continue;
-            }
-            Err(PcapError::BufferTooSmall) => {
-                let current_size = pcap_reader.data().len();
-                let new_size = current_size * 2;
-                if !pcap_reader.grow(new_size) {
-                    return Err(VerifyError::MalformedBlock(
-                        format!("Buffer too small (current: {}), cannot grow to {}", current_size, new_size),
-                        current_offset
-                    ));
-                }
-                if let Err(e) = pcap_reader.refill() {
-                    return Err(VerifyError::PcapError(format!("Refill error: {:?}", e)));
-                }
-                continue;
-            }
-            Err(PcapError::UnexpectedEof) => {
-                // Unexpected EOF means the file is incomplete/corrupted
-                // Even if we processed some blocks, the file is not valid
-                let msg = if stats.epb_count > 0 {
-                    format!("Unexpected EOF after {} blocks - file is incomplete/truncated", stats.epb_count)
-                } else {
-                    "File appears to be truncated or invalid".to_string()
-                };
-                return Err(VerifyError::MalformedBlock(msg, current_offset));
-            }
-            Err(e) => return Err(VerifyError::from(e)),
-        }
-    }
+    iterator.iterate(&mut handler)?;
 
     // Final validation
-    if !section_found {
+    if !iterator.state().section_found {
         return Err(VerifyError::MissingSectionHeader);
     }
 
-    if !idb_found {
+    if !iterator.state().idb_found {
         return Err(VerifyError::MissingInterfaceDescription);
     }
 
     if verbose {
-        stats.print_summary();
+        handler.stats.print_summary();
     }
 
-    Ok(stats)
+    Ok(handler.stats)
 }
 
 /// Verify a single PCAP block
 fn verify_block(
     block: &PcapBlockOwned,
     stats: &mut VerifyStats,
-    section_found: &mut bool,
-    idb_found: &mut bool,
+    state: &mut IterationState,
     epb_seen: &mut bool,
-    current_offset: u64,
     verbose: bool,
 ) -> Result<(), VerifyError> {
+    let current_offset = state.current_offset;
     match block {
         PcapBlockOwned::NG(ng_block) => {
             use pcap_parser::pcapng::*;
@@ -353,7 +337,7 @@ fn verify_block(
                         println!("  ✓ Version: {}.{}", shb.major_version, shb.minor_version);
                     }
                     
-                    *section_found = true;
+                    state.section_found = true;
                     stats.section_header_found = true;
                 }
                 Block::InterfaceDescription(idb) => {
@@ -388,7 +372,7 @@ fn verify_block(
                         println!("  ✓ Snap length: {}", idb.snaplen);
                     }
                     
-                    *idb_found = true;
+                    state.idb_found = true;
                     stats.idb_found = true;
                 }
                 Block::EnhancedPacket(epb) => {

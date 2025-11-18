@@ -1,10 +1,10 @@
 use crate::model::structs::*;
+use crate::reader::pcap_iter::{PcapIterator, PcapIterError, DEFAULT_BUFFER_SIZE};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use pcap_parser::{PcapBlockOwned, PcapError, PcapNGReader};
-use pcap_parser::traits::PcapReaderIterator;
+use pcap_parser::PcapBlockOwned;
 
 /// Errors that can occur during cleanup
 #[derive(Debug)]
@@ -23,9 +23,14 @@ impl From<std::io::Error> for CleanupError {
     }
 }
 
-impl<I: std::fmt::Debug> From<PcapError<I>> for CleanupError {
-    fn from(err: PcapError<I>) -> Self {
-        CleanupError::PcapError(format!("{:?}", err))
+impl From<PcapIterError> for CleanupError {
+    fn from(err: PcapIterError) -> Self {
+        match err {
+            PcapIterError::IoError(e) => CleanupError::IoError(e),
+            PcapIterError::PcapError(e) => CleanupError::PcapError(e),
+            PcapIterError::InvalidFormat(e) => CleanupError::InvalidStructure(e),
+            PcapIterError::IncompleteData(e) => CleanupError::InvalidStructure(e),
+        }
     }
 }
 
@@ -50,6 +55,8 @@ pub struct CleanupStats {
     pub blocks_removed: u64,
     pub section_header_found: bool,
     pub idb_found: bool,
+    pub failure_reason: Option<String>,
+    pub failure_offset: Option<u64>,
 }
 
 impl CleanupStats {
@@ -67,11 +74,113 @@ impl CleanupStats {
         println!("  Blocks Kept:      {}", self.blocks_kept);
         println!("  Blocks Removed:   {}", self.blocks_removed);
         
-        if self.blocks_removed > 0 {
+        if self.blocks_removed > 0 || self.failure_reason.is_some() {
             let bytes_removed = self.original_size.saturating_sub(self.cleaned_size);
             println!("  Data Removed:     {} bytes ({:.2} MB)", 
                      bytes_removed,
                      bytes_removed as f64 / (1024.0 * 1024.0));
+            
+            if let Some(ref reason) = self.failure_reason {
+                println!("\n⚠ File truncated due to: {}", reason);
+                if let Some(offset) = self.failure_offset {
+                    println!("  Failure at offset: 0x{:08x} ({} bytes)", offset, offset);
+                }
+            }
+        }
+        
+        if !self.section_header_found {
+            println!("\n⚠ Warning: Section Header Block not found or invalid");
+        }
+        if !self.idb_found {
+            println!("\n⚠ Warning: Interface Description Block not found or invalid");
+        }
+    }
+}
+
+/// Validates a block and returns whether it's valid
+fn validate_block(
+    block: &PcapBlockOwned,
+    section_found: &mut bool,
+    idb_found: &mut bool,
+    current_offset: u64,
+    verbose: bool,
+) -> Result<bool, (String, u64)> {
+    match block {
+        PcapBlockOwned::NG(ng_block) => {
+            use pcap_parser::pcapng::*;
+            
+            match ng_block {
+                Block::SectionHeader(shb) => {
+                    // Check if we already have a section header
+                    if *section_found {
+                        return Err(("Multiple Section Header blocks found".to_string(), current_offset));
+                    }
+                    
+                    // Validate magic number
+                    if shb.block_type != FD_SOLCAP_V2_FILE_MAGIC {
+                        return Err((format!("Invalid Section Header magic number: 0x{:08x} (expected 0x{:08x})", 
+                            shb.block_type, FD_SOLCAP_V2_FILE_MAGIC), current_offset));
+                    }
+                    
+                    *section_found = true;
+                    
+                    if verbose {
+                        println!("✓ Section Header Block (offset: 0x{:08x})", current_offset);
+                    }
+                    Ok(true)
+                }
+                Block::InterfaceDescription(idb) => {
+                    // Check ordering
+                    if !*section_found {
+                        return Err(("Interface Description Block found before Section Header".to_string(), current_offset));
+                    }
+                    
+                    if *idb_found {
+                        return Err(("Multiple Interface Description blocks found".to_string(), current_offset));
+                    }
+                    
+                    // Validate link type
+                    let linktype_value = idb.linktype.0;
+                    let expected_linktype = SOLCAP_IDB_HDR_LINK_TYPE as i32;
+                    if linktype_value != expected_linktype {
+                        return Err((format!("Invalid IDB link type: {} (expected {})", 
+                            linktype_value, expected_linktype), current_offset));
+                    }
+                    
+                    *idb_found = true;
+                    
+                    if verbose {
+                        println!("✓ Interface Description Block (offset: 0x{:08x})", current_offset);
+                    }
+                    Ok(true)
+                }
+                Block::EnhancedPacket(epb) => {
+                    // Check ordering
+                    if !*section_found || !*idb_found {
+                        return Err(("Enhanced Packet Block found before required headers".to_string(), current_offset));
+                    }
+                    
+                    // Validate EPB has minimum data for internal header
+                    let packet_data = epb.data;
+                    if packet_data.len() < mem::size_of::<SolcapChunkIntHdr>() {
+                        return Err((format!("EPB too small for internal header: {} bytes (need at least {})", 
+                            packet_data.len(), mem::size_of::<SolcapChunkIntHdr>()), current_offset));
+                    }
+                    
+                    Ok(true)
+                }
+                _ => {
+                    // Other block types are allowed
+                    if verbose {
+                        println!("✓ Other block type (offset: 0x{:08x})", current_offset);
+                    }
+                    Ok(true)
+                }
+            }
+        }
+        _ => {
+            // Legacy PCAP format not supported
+            Err(("Legacy PCAP format not supported".to_string(), current_offset))
         }
     }
 }
@@ -103,8 +212,8 @@ pub fn cleanup_solcap<P: AsRef<Path>>(input_path: P, verbose: bool) -> Result<Cl
         .open(&output_path)?;
     let mut buf_writer = BufWriter::new(output_file);
     
-    // Create PCAP reader
-    let mut pcap_reader = PcapNGReader::new(64 * 1024 * 1024, buf_reader)?;
+    // Create iterator - we'll use it for initialization but manually iterate for raw data access
+    let mut iterator = PcapIterator::with_buffer_size(buf_reader, DEFAULT_BUFFER_SIZE)?;
     
     let mut stats = CleanupStats {
         original_size,
@@ -113,191 +222,161 @@ pub fn cleanup_solcap<P: AsRef<Path>>(input_path: P, verbose: bool) -> Result<Cl
     
     let mut section_found = false;
     let mut idb_found = false;
-    let mut block_count = 0;
+    let mut truncate_at: Option<u64> = None;
+    let mut failure_reason: Option<String> = None;
+    let mut failure_offset: Option<u64> = None;
     
     if verbose {
-        println!("Reading and copying valid blocks...\n");
+        println!("Reading and validating blocks...\n");
     }
     
+    // Use manual iteration to access raw data for writing
+    use pcap_parser::traits::PcapReaderIterator;
+    let reader = iterator.reader_mut();
+    
     loop {
-        let position_before = pcap_reader.position() as u64;
-        let result = pcap_reader.next();
+        let position_before = reader.position() as u64;
+        let result = reader.next();
         
         match result {
             Ok((offset, block)) => {
-                // Validate the block before writing
-                match &block {
-                    PcapBlockOwned::NG(ng_block) => {
-                        use pcap_parser::pcapng::*;
+                // Store offset and block type for later use
+                let block_offset = offset;
+                let is_epb = matches!(block, PcapBlockOwned::NG(pcap_parser::pcapng::Block::EnhancedPacket(_)));
+                
+                // Validate the block
+                let validation_result = validate_block(&block, &mut section_found, &mut idb_found, position_before, verbose);
+                
+                // Drop block reference to release borrow before accessing reader.data()
+                drop(block);
+                
+                match validation_result {
+                    Ok(_) => {
+                        // Block is valid, write it
+                        let raw_data = reader.data();
+                        let data_slice = &raw_data[..block_offset];
+                        buf_writer.write_all(data_slice)?;
                         
-                        match ng_block {
-                            Block::SectionHeader(shb) => {
-                                if section_found {
-                                    eprintln!("Warning: Multiple section headers found, stopping at first section");
-                                    break;
-                                }
-                                
-                                // Validate magic number
-                                if shb.block_type != FD_SOLCAP_V2_FILE_MAGIC {
-                                    return Err(CleanupError::InvalidStructure(
-                                        format!("Invalid magic number: 0x{:08x}", shb.block_type)
-                                    ));
-                                }
-                                
-                                section_found = true;
-                                stats.section_header_found = true;
-                                
-                                if verbose {
-                                    println!("✓ Section Header Block (offset: 0x{:08x})", position_before);
-                                }
-                            }
-                            Block::InterfaceDescription(_idb) => {
-                                if !section_found {
-                                    return Err(CleanupError::InvalidStructure(
-                                        "IDB found before Section Header".to_string()
-                                    ));
-                                }
-                                if idb_found {
-                                    eprintln!("Warning: Multiple IDB blocks found, keeping first one");
-                                    break;
-                                }
-                                
-                                idb_found = true;
-                                stats.idb_found = true;
-                                
-                                if verbose {
-                                    println!("✓ Interface Description Block (offset: 0x{:08x})", position_before);
-                                }
-                            }
-                            Block::EnhancedPacket(epb) => {
-                                if !section_found || !idb_found {
-                                    return Err(CleanupError::InvalidStructure(
-                                        "EPB found before Section Header or IDB".to_string()
-                                    ));
-                                }
-                                
-                                // Validate EPB has minimum data for internal header
-                                let packet_data = epb.data;
-                                if packet_data.len() < mem::size_of::<SolcapChunkIntHdr>() {
-                                    if verbose {
-                                        println!("✗ Invalid EPB at offset 0x{:08x} (too small for internal header), stopping here", position_before);
-                                    }
-                                    stats.blocks_removed += 1;
-                                    break;
-                                }
-                                
-                                block_count += 1;
-                                
-                                if verbose && block_count == 1 {
-                                    println!("✓ First EPB (offset: 0x{:08x})", position_before);
-                                } else if verbose && block_count % 1000 == 0 {
-                                    println!("  ... processed {} EPB blocks", block_count);
-                                }
-                            }
-                            _ => {
-                                // Other block types are allowed
-                                if verbose {
-                                    println!("✓ Other block type (offset: 0x{:08x})", position_before);
-                                }
-                            }
+                        stats.blocks_kept += 1;
+                        stats.cleaned_size += block_offset as u64;
+                        
+                        // Update stats for headers
+                        if section_found {
+                            stats.section_header_found = true;
                         }
+                        if idb_found {
+                            stats.idb_found = true;
+                        }
+                        
+                        if verbose && stats.blocks_kept == 1 && is_epb {
+                            println!("✓ First EPB (offset: 0x{:08x})", position_before);
+                        } else if verbose && stats.blocks_kept > 0 && stats.blocks_kept % 1000 == 0 {
+                            println!("  ... processed {} blocks", stats.blocks_kept);
+                        }
+                        
+                        reader.consume(block_offset);
                     }
-                    _ => {
-                        return Err(CleanupError::InvalidStructure(
-                            "Legacy PCAP format not supported".to_string()
-                        ));
+                    Err((reason, offset)) => {
+                        // Block is invalid, truncate here
+                        truncate_at = Some(offset);
+                        failure_reason = Some(reason);
+                        failure_offset = Some(offset);
+                        if verbose {
+                            println!("\n✗ Invalid block at offset 0x{:08x}, truncating file here", offset);
+                        }
+                        break;
                     }
                 }
-                
-                // Write the raw block data to output
-                // We need to get the raw data from the reader
-                let data_to_write = pcap_reader.data();
-                let data_slice = &data_to_write[..offset];
-                buf_writer.write_all(data_slice)?;
-                
-                stats.blocks_kept += 1;
-                stats.cleaned_size += offset as u64;
-                
-                pcap_reader.consume(offset);
             }
-            Err(PcapError::Eof) => {
+            Err(pcap_parser::PcapError::Eof) => {
                 // Normal end of file
                 if verbose {
                     println!("\n✓ Reached end of file normally");
                 }
                 break;
             }
-            Err(PcapError::Incomplete(_n)) => {
+            Err(pcap_parser::PcapError::Incomplete(_n)) => {
                 // Try to refill and continue
-                if let Err(_) = pcap_reader.refill() {
-                    // Can't refill, we've hit the end
+                if let Err(_) = reader.refill() {
+                    // Can't refill, truncate here
+                    truncate_at = Some(position_before);
+                    failure_reason = Some("Incomplete block at end of file".to_string());
+                    failure_offset = Some(position_before);
                     if verbose {
-                        println!("\n✓ Reached incomplete block at offset 0x{:08x}, stopping here", position_before);
+                        println!("\n✗ Incomplete block at offset 0x{:08x}, truncating here", position_before);
                     }
-                    stats.blocks_removed += 1;
                     break;
                 }
                 continue;
             }
-            Err(PcapError::BufferTooSmall) => {
-                let current_size = pcap_reader.data().len();
+            Err(pcap_parser::PcapError::BufferTooSmall) => {
+                let current_size = reader.data().len();
                 let new_size = current_size * 2;
-                if !pcap_reader.grow(new_size) {
+                if !reader.grow(new_size) {
+                    // Can't grow, truncate here
+                    truncate_at = Some(position_before);
+                    failure_reason = Some("Block too large to process".to_string());
+                    failure_offset = Some(position_before);
                     if verbose {
-                        println!("\n✗ Block too large at offset 0x{:08x}, stopping here", position_before);
+                        println!("\n✗ Block too large at offset 0x{:08x}, truncating here", position_before);
                     }
-                    stats.blocks_removed += 1;
                     break;
                 }
-                if let Err(_) = pcap_reader.refill() {
+                if let Err(_) = reader.refill() {
+                    // Can't refill after growth, truncate here
+                    truncate_at = Some(position_before);
+                    failure_reason = Some("Incomplete block after buffer growth".to_string());
+                    failure_offset = Some(position_before);
                     if verbose {
-                        println!("\n✓ Reached incomplete block at offset 0x{:08x}, stopping here", position_before);
+                        println!("\n✗ Incomplete block at offset 0x{:08x}, truncating here", position_before);
                     }
-                    stats.blocks_removed += 1;
                     break;
                 }
                 continue;
             }
-            Err(PcapError::UnexpectedEof) => {
-                // Incomplete block at end of file
+            Err(pcap_parser::PcapError::UnexpectedEof) => {
+                // Unexpected EOF - truncate here
+                truncate_at = Some(position_before);
+                failure_reason = Some("Unexpected EOF encountered".to_string());
+                failure_offset = Some(position_before);
                 if verbose {
-                    println!("\n✓ Encountered unexpected EOF at offset 0x{:08x}, stopping before incomplete block", position_before);
+                    println!("\n✗ Unexpected EOF at offset 0x{:08x}, truncating here", position_before);
                 }
-                stats.blocks_removed += 1;
                 break;
             }
             Err(e) => {
-                // Other parsing error
+                // Other parsing error - truncate here
+                truncate_at = Some(position_before);
+                failure_reason = Some(format!("Parsing error: {:?}", e));
+                failure_offset = Some(position_before);
                 if verbose {
-                    println!("\n✗ Parsing error at offset 0x{:08x}: {:?}, stopping here", position_before, e);
+                    println!("\n✗ Parsing error at offset 0x{:08x}: {:?}, truncating here", position_before, e);
                 }
-                stats.blocks_removed += 1;
                 break;
             }
         }
     }
     
-    // Flush output buffer
+    // Flush and close writer
     buf_writer.flush()?;
     drop(buf_writer);
     
-    // Verify we got minimum required blocks
-    if !stats.section_header_found {
-        return Err(CleanupError::InvalidStructure(
-            "No valid Section Header Block found".to_string()
-        ));
+    // Update stats
+    stats.section_header_found = section_found;
+    stats.idb_found = idb_found;
+    stats.failure_reason = failure_reason;
+    stats.failure_offset = failure_offset;
+    
+    // Calculate blocks removed
+    if truncate_at.is_some() {
+        stats.blocks_removed = 1; // At least one block was invalid
     }
     
-    if !stats.idb_found {
-        return Err(CleanupError::InvalidStructure(
-            "No valid Interface Description Block found".to_string()
-        ));
-    }
+    // Get final file size
+    let final_size = std::fs::metadata(&output_path)?.len();
+    stats.cleaned_size = final_size;
     
-    if verbose {
-        println!("\nFlushing output file...");
-    }
-    
+    // Print summary
     stats.print_summary(input_path, &output_path);
     
     Ok(stats)

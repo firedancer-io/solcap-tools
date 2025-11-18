@@ -2,20 +2,23 @@ use crate::reader::{read_solcap_file, SolcapReaderError};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-/// Print information about a solcap file
-/// 
-/// Verbosity levels:
-/// - 1: Only bank hash from preimage
-/// - 2: Full preimage data
-/// - 3: Level 2 + final account metadata
-/// - 4: Level 3 + account data
-/// 
-/// # Arguments
-/// - `file_path` - Path to the solcap file
-/// - `verbosity` - Verbosity level (1-4)
-/// - `start_slot` - Optional starting slot to display (inclusive)
-/// - `end_slot` - Optional ending slot to display (inclusive)
-/// - `show_all_updates` - If true, shows all account updates; if false, shows only final updates
+/*
+ Print information about a solcap file
+
+ Verbosity levels:
+ - 1: Only bank hash from preimage
+ - 2: Full preimage data
+ - 3: Level 2 + final account metadata
+ - 4: Level 3 + account data
+
+ # Arguments
+ - `file_path` - Path to the solcap file
+ - `verbosity` - Verbosity level (1-4)
+ - `start_slot` - Optional starting slot to display (inclusive)
+ - `end_slot` - Optional ending slot to display (inclusive)
+ - `show_all_updates` - If true, shows all account updates; if false, shows only final updates
+*/
+
 pub fn print_solcap_info(
     file_path: &str,
     verbosity: u8,

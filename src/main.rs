@@ -1,5 +1,5 @@
 use clap::{Arg, Command};
-use solcap_tools::tools::{print_solcap_info, diff_solcap, explore_solcap, scan_solcap, verify_solcap, cleanup_solcap, coalesce_solcap};
+use solcap_tools::tools::{print_solcap_info, diff_solcap, explore_solcap, compare_solcap, verify_solcap, cleanup_solcap, combine_solcap};
 
 fn main() {
     let matches = Command::new("solcap-tools")
@@ -99,8 +99,8 @@ fn main() {
                 )
         )
         .subcommand(
-            Command::new("scan")
-                .about("Interactively scan and compare two solcap files or bank_hash_details directories")
+            Command::new("compare")
+                .about("Interactively compare two solcap files or bank_hash_details directories")
                 .arg(
                     Arg::new("path1")
                         .value_name("PATH1")
@@ -153,8 +153,8 @@ fn main() {
                 )
         )
         .subcommand(
-            Command::new("coalesce")
-                .about("Merge multiple solcap files into a single file, ordered by modification time")
+            Command::new("combine")
+                .about("Combine multiple solcap files into a single file, ordered by modification time")
                 .arg(
                     Arg::new("files")
                         .value_name("FILES")
@@ -168,7 +168,7 @@ fn main() {
                         .short('o')
                         .long("output")
                         .value_name("OUTPUT")
-                        .help("Output file path (default: coalesced.solcap)"),
+                        .help("Output file path (default: combined.solcap)"),
                 )
                 .arg(
                     Arg::new("verbose")
@@ -215,12 +215,12 @@ fn main() {
                 }
             }
         }
-        Some(("scan", sub_matches)) => {
+        Some(("compare", sub_matches)) => {
             if let (Some(path1), Some(path2)) = (
                 sub_matches.get_one::<String>("path1"),
                 sub_matches.get_one::<String>("path2"),
             ) {
-                if let Err(e) = scan_solcap(path1, path2) {
+                if let Err(e) = compare_solcap(path1, path2) {
                     eprintln!("Error: {:?}", e);
                     std::process::exit(1);
                 }
@@ -258,7 +258,7 @@ fn main() {
                 }
             }
         }
-        Some(("coalesce", sub_matches)) => {
+        Some(("combine", sub_matches)) => {
             let files: Vec<String> = sub_matches
                 .get_many::<String>("files")
                 .unwrap()
@@ -267,12 +267,12 @@ fn main() {
             let output = sub_matches.get_one::<String>("output").cloned();
             let verbose = sub_matches.get_flag("verbose");
             
-            match coalesce_solcap(&files, output, verbose) {
+            match combine_solcap(&files, output, verbose) {
                 Ok(_stats) => {
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    eprintln!("✗ Coalesce failed: {}", e);
+                    eprintln!("✗ Combine failed: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -284,11 +284,11 @@ fn main() {
             println!("  solcap-tools print input.solcap");
             println!("  solcap-tools diff file1.solcap file2.solcap");
             println!("  solcap-tools explore input.solcap");
-            println!("  solcap-tools scan file1.solcap file2.solcap");
+            println!("  solcap-tools compare file1.solcap file2.solcap");
             println!("  solcap-tools verify input.solcap");
             println!("  solcap-tools verify /path/to/directory");
             println!("  solcap-tools cleanup corrupted.solcap");
-            println!("  solcap-tools coalesce file1.solcap file2.solcap file3.solcap -o merged.solcap");
+            println!("  solcap-tools combine file1.solcap file2.solcap file3.solcap -o merged.solcap");
         }
     }
 }

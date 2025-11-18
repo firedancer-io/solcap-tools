@@ -1,8 +1,8 @@
 use crate::model::structs::*;
 use crate::reader::structures::{AccountUpdate, SolcapData};
+use crate::reader::pcap_iter::{BlockHandler, IterationState, PcapIterator, PcapIterError, DEFAULT_BUFFER_SIZE};
 use crate::utils::spinner::Spinner;
-use pcap_parser::{PcapBlockOwned, PcapError, PcapNGReader};
-use pcap_parser::traits::PcapReaderIterator;
+use pcap_parser::PcapBlockOwned;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::mem;
@@ -27,113 +27,55 @@ impl From<std::io::Error> for SolcapReaderError {
     }
 }
 
-impl<I: std::fmt::Debug> From<PcapError<I>> for SolcapReaderError {
-    fn from(err: PcapError<I>) -> Self {
-        SolcapReaderError::PcapError(format!("{:?}", err))
+impl From<PcapIterError> for SolcapReaderError {
+    fn from(err: PcapIterError) -> Self {
+        match err {
+            PcapIterError::IoError(e) => SolcapReaderError::IoError(e),
+            PcapIterError::PcapError(e) => SolcapReaderError::PcapError(e),
+            PcapIterError::InvalidFormat(e) => SolcapReaderError::InvalidFormat(e),
+            PcapIterError::IncompleteData(e) => SolcapReaderError::IncompleteData(e),
+        }
     }
 }
 
-/// Reader for solcap files in pcapng format
-pub struct SolcapReader<R: Read> {
-    reader: PcapNGReader<R>,
-    current_offset: u64,
+/// Block handler for parsing solcap files
+struct SolcapParseHandler {
+    data: SolcapData,
 }
 
-impl SolcapReader<BufReader<File>> {
-    /// Create a new SolcapReader from a file path
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, SolcapReaderError> {
-        let file = File::open(path)?;
-        let buf_reader = BufReader::new(file);
-        Self::new(buf_reader)
+impl BlockHandler for SolcapParseHandler {
+    type Error = SolcapReaderError;
+
+    fn handle_block(
+        &mut self,
+        block: &PcapBlockOwned,
+        state: &mut IterationState,
+        _offset: usize,
+    ) -> Result<(), Self::Error> {
+        Self::process_block(block, &mut self.data, state)
+    }
+
+    fn handle_unexpected_eof(
+        &mut self,
+        state: &mut IterationState,
+    ) -> Result<(), Self::Error> {
+        // Allow partial files - just warn
+        if state.blocks_processed > 0 {
+            eprintln!("Warning: Unexpected EOF encountered (may be incomplete last block), but {} blocks were processed successfully", state.blocks_processed);
+            Ok(())
+        } else {
+            Err(SolcapReaderError::IncompleteData(
+                "File appears to be truncated or invalid".to_string()
+            ))
+        }
     }
 }
 
-impl<R: Read> SolcapReader<R> {
-    /// Create a new SolcapReader from any Read implementation
-    pub fn new(reader: R) -> Result<Self, SolcapReaderError> {
-        // Use a larger buffer size (64MB) to handle larger blocks in solcap files
-        // Solcap files can contain very large account data blocks
-        let pcap_reader = PcapNGReader::new(64 * 1024 * 1024, reader)?;
-        Ok(Self {
-            reader: pcap_reader,
-            current_offset: 0,
-        })
-    }
-
-    /// Parse the entire solcap file and build in-memory structures
-    pub fn parse_file(&mut self) -> Result<SolcapData, SolcapReaderError> {
-        let mut data = SolcapData::new();
-        let mut section_found = false;
-        let mut idb_found = false;
-        let mut blocks_processed = 0;
-
-        loop {
-            let result = self.reader.next();
-            match result {
-                Ok((offset, block)) => {
-                    Self::process_block(&block, &mut data, &mut section_found, &mut idb_found, self.current_offset)?;
-                    self.current_offset += offset as u64;
-                    self.reader.consume(offset);
-                    blocks_processed += 1;
-                }
-                Err(PcapError::Eof) => break,
-                Err(PcapError::Incomplete(_n)) => {
-                    if let Err(e) = self.reader.refill() {
-                        return Err(SolcapReaderError::from(e));
-                    }
-                    continue;
-                }
-                Err(PcapError::BufferTooSmall) => {
-                    let current_size = self.reader.data().len();
-                    let new_size = current_size * 2;
-                    if !self.reader.grow(new_size) {
-                        return Err(SolcapReaderError::InvalidFormat(
-                            format!("Buffer too small (current: {}), cannot grow to {}", current_size, new_size)
-                        ));
-                    }
-                    if let Err(e) = self.reader.refill() {
-                        return Err(SolcapReaderError::from(e));
-                    }
-                    continue;
-                }
-                Err(PcapError::UnexpectedEof) => {
-                    println!("DEBUG: UnexpectedEof - blocks processed: {}, exhausted: {}, buffer remaining: {} bytes", 
-                             blocks_processed, self.reader.reader_exhausted(), self.reader.data().len());
-                    if blocks_processed > 0 {
-                        eprintln!("Warning: Unexpected EOF encountered (may be incomplete last block), but {} blocks were processed successfully", blocks_processed);
-                        break;
-                    } else {
-                        return Err(SolcapReaderError::IncompleteData(
-                            "File appears to be truncated or invalid".to_string()
-                        ));
-                    }
-                }
-                Err(e) => return Err(SolcapReaderError::from(e)),
-            }
-        }
-
-        if !section_found {
-            return Err(SolcapReaderError::InvalidFormat(
-                "No Section Header Block found".to_string(),
-            ));
-        }
-
-        if !idb_found {
-            return Err(SolcapReaderError::InvalidFormat(
-                "No Interface Description Block found".to_string(),
-            ));
-        }
-
-        Ok(data)
-    }
-
-    /// Process a single pcapng block
+impl SolcapParseHandler {
     fn process_block(
         block: &PcapBlockOwned,
         data: &mut SolcapData,
-        section_found: &mut bool,
-        idb_found: &mut bool,
-        current_offset: u64,
+        state: &mut IterationState,
     ) -> Result<(), SolcapReaderError> {
         match block {
             PcapBlockOwned::NG(ng_block) => {
@@ -141,15 +83,13 @@ impl<R: Read> SolcapReader<R> {
                 
                 match ng_block {
                     Block::SectionHeader(_) => {
-                        *section_found = true;
-                        // Validate magic numbers if needed
+                        state.section_found = true;
                     }
                     Block::InterfaceDescription(_) => {
-                        *idb_found = true;
-                        // Validate link type if needed (should be 147 for DLT_USER(0))
+                        state.idb_found = true;
                     }
                     Block::EnhancedPacket(epb) => {
-                        Self::process_enhanced_packet_block(epb, data, current_offset)?;
+                        Self::process_enhanced_packet_block(epb, data, state.current_offset)?;
                     }
                     _ => {
                         // Ignore other block types for now
@@ -263,6 +203,40 @@ impl<R: Read> SolcapReader<R> {
 
         solcap_data.add_bank_preimage(slot, bank_preimage);
         Ok(())
+    }
+}
+
+/// Reader for solcap files in pcapng format
+pub struct SolcapReader<R: Read> {
+    iterator: PcapIterator<R>,
+}
+
+impl SolcapReader<BufReader<File>> {
+    /// Create a new SolcapReader from a file path
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, SolcapReaderError> {
+        let file = File::open(path)?;
+        let buf_reader = BufReader::new(file);
+        Self::new(buf_reader)
+    }
+}
+
+impl<R: Read> SolcapReader<R> {
+    /// Create a new SolcapReader from any Read implementation
+    pub fn new(reader: R) -> Result<Self, SolcapReaderError> {
+        let iterator = PcapIterator::with_buffer_size(reader, DEFAULT_BUFFER_SIZE)?;
+        Ok(Self { iterator })
+    }
+
+    /// Parse the entire solcap file and build in-memory structures
+    pub fn parse_file(&mut self) -> Result<SolcapData, SolcapReaderError> {
+        let mut handler = SolcapParseHandler {
+            data: SolcapData::new(),
+        };
+
+        self.iterator.iterate(&mut handler)?;
+        self.iterator.validate_headers()?;
+
+        Ok(handler.data)
     }
 }
 

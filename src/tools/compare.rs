@@ -426,7 +426,8 @@ impl App {
             }
         }).collect();
         
-        accounts.sort_by_key(|a| a.account);
+        // Sort by has_diff first (true comes first), then by account for stable ordering
+        accounts.sort_by_key(|a| (!a.has_diff, a.account));
         
         self.account_cache.insert(cache_key, accounts);
         self.current_cached_slot = Some(slot);

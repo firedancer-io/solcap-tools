@@ -1,6 +1,6 @@
 use crate::reader::{read_solcap_file, read_account_data, SolcapData, SolcapReaderError, AccountUpdate};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -856,7 +856,7 @@ pub fn explore_solcap<P: AsRef<Path>>(file_path: P) -> Result<(), SolcapReaderEr
         SolcapReaderError::InvalidFormat(format!("Failed to enable raw mode: {}", e))
     })?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(|e| {
+    execute!(stdout, EnterAlternateScreen).map_err(|e| {
         SolcapReaderError::InvalidFormat(format!("Failed to setup terminal: {}", e))
     })?;
     let backend = CrosstermBackend::new(stdout);
@@ -874,8 +874,7 @@ pub fn explore_solcap<P: AsRef<Path>>(file_path: P) -> Result<(), SolcapReaderEr
     })?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        LeaveAlternateScreen
     )
     .map_err(|e| {
         SolcapReaderError::InvalidFormat(format!("Failed to restore terminal: {}", e))

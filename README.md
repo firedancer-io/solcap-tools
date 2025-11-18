@@ -194,12 +194,12 @@ The `explore` subcommand provides an interactive terminal UI to navigate through
 solcap-tools explore <file.solcap>
 ```
 
-### Interactive Scanner
+### Interactive Comparison
 
-The `scan` subcommand provides an interactive comparison interface for two solcap files:
+The `compare` subcommand provides an interactive comparison interface for two solcap files:
 
 ```bash
-solcap-tools scan file1.solcap file2.solcap
+solcap-tools compare file1.solcap file2.solcap
 ```
 
 ### Cleanup Corrupted Files
@@ -248,19 +248,19 @@ Statistics:
 - Prepare corrupted files for analysis tools
 - Salvage as much data as possible from damaged captures
 
-### Coalesce Multiple Files
+### Combine Multiple Files
 
-The `coalesce` subcommand merges multiple solcap files into a single file:
+The `combine` subcommand merges multiple solcap files into a single file:
 
 ```bash
 # Merge files (automatically ordered by modification time, oldest first)
-solcap-tools coalesce file1.solcap file2.solcap file3.solcap
+solcap-tools combine file1.solcap file2.solcap file3.solcap
 
 # Specify custom output path
-solcap-tools coalesce file1.solcap file2.solcap -o merged.solcap
+solcap-tools combine file1.solcap file2.solcap -o merged.solcap
 
 # Verbose mode showing detailed merge process
-solcap-tools coalesce *.solcap -o combined.solcap --verbose
+solcap-tools combine *.solcap -o combined.solcap --verbose
 ```
 
 **How it works:**
@@ -274,13 +274,13 @@ solcap-tools coalesce *.solcap -o combined.solcap --verbose
 
 **Output example:**
 ```bash
-Coalescing 3 file(s) into: merged.solcap
+Combining 3 file(s) into: merged.solcap
 
   ✓ file1.solcap - 10000 EPB blocks
   ✓ file2.solcap - 15000 EPB blocks
   ✓ file3.solcap - 8500 EPB blocks
 
-✓ Coalescing completed successfully!
+✓ Combining completed successfully!
 
 Output File:  merged.solcap
 
@@ -397,12 +397,12 @@ cargo doc --open
 
 ## Future Enhancements
 
-- [x] Interactive TUI mode with navigation (explore/scan commands)
+- [x] Interactive TUI mode with navigation (explore/compare commands)
 - [x] Diff tool to compare two captures
 - [x] File format verification tool
 - [x] Batch verification for multiple files
 - [x] Repair/cleanup tool for corrupted files
-- [x] Coalesce/merge tool for combining multiple files
+- [x] Combine/merge tool for combining multiple files
 - [ ] Streaming parser for large files
 - [ ] Export to other formats (JSON, CSV)
 - [ ] Filter by account, owner, or other criteria
