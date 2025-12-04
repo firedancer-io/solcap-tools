@@ -1,21 +1,6 @@
 use crate::model::structs::{Pubkey, SolanaAccountMeta, SolcapBankPreimage};
 use std::collections::HashMap;
 
-/// Common account information shared between different readers
-#[derive(Debug, Clone)]
-pub struct AccountInfo {
-    /// The account's public key
-    pub key: Pubkey,
-    /// Account metadata (lamports, owner, etc.)
-    pub meta: SolanaAccountMeta,
-    /// Size of the account data
-    pub data_size: u64,
-    /// Offset in the file where the account data starts
-    pub data_offset: u64,
-    /// Optional file path (used for bank_hash_details, blank for solcap)
-    pub file: Option<String>,
-}
-
 /// Represents an account update with metadata and file offset for data
 #[derive(Debug, Clone)]
 pub struct AccountUpdate {
@@ -29,9 +14,9 @@ pub struct AccountUpdate {
     pub data_offset: u64,
     /// Slot when this update occurred
     pub slot: u32,
-    /// Transaction index within the slot
-    pub txn_idx: u64,
-    /// Optional file path (used for bank_hash_details, blank for solcap)
+    /// Transaction index within the slot (None for formats that don't provide it, like Agave BHD)
+    pub txn_idx: Option<u64>,
+    /* Optional file path (used for bank_hash_details, blank for solcap) */
     pub file: Option<String>,
 }
 
@@ -42,12 +27,12 @@ pub struct SolcapData {
     pub lowest_slot: u32,
     /// The highest slot number found in the file  
     pub highest_slot: u32,
-    /// Array of bank preimages indexed by (slot - lowest_slot)
-    /// Index 0 corresponds to lowest_slot, index (highest_slot - lowest_slot) to highest_slot
+    /* Array of bank preimages indexed by (slot - lowest_slot)
+       Index 0 corresponds to lowest_slot, index (highest_slot - lowest_slot) to highest_slot */
     pub bank_preimages: Vec<Option<SolcapBankPreimage>>,
     /// Map from slot number to list of ALL account updates that occurred in that slot
     pub slot_account_updates_all: HashMap<u32, Vec<AccountUpdate>>,
-    /// Map from slot number to map of account key to final account update (highest txn_idx)
+    /// Map from slot number to map of account key to final account update (highest txn_idx if available)
     pub slot_account_updates_final: HashMap<u32, HashMap<[u8; 32], AccountUpdate>>,
 }
 
@@ -67,29 +52,29 @@ impl SolcapData {
     pub fn update_slot_range(&mut self, slot: u32) {
         let mut range_changed = false;
         
-        // IMPORTANT: Save the OLD lowest_slot BEFORE updating it!
-        // We need this to know which slots the existing preimages belong to.
+        /* IMPORTANT: Save the OLD lowest_slot BEFORE updating it!
+           We need this to know which slots the existing preimages belong to. */
         let old_lowest_slot = self.lowest_slot;
 
-        // Update lowest slot
+        /* Update lowest slot */
         if slot < self.lowest_slot {
             self.lowest_slot = slot;
             range_changed = true;
         }
 
-        // Update highest slot
+        /* Update highest slot */
         if slot > self.highest_slot {
             self.highest_slot = slot;
             range_changed = true;
         }
 
-        // Resize bank_preimages array if range changed
+        /* Resize bank_preimages array if range changed */
         if range_changed {
             let new_size = (self.highest_slot - self.lowest_slot + 1) as usize;
             let mut new_preimages = vec![None; new_size];
             
-            // Copy existing preimages to new array with adjusted indices
-            // Use old_lowest_slot (not self.lowest_slot) to calculate original slot numbers
+            /* Copy existing preimages to new array with adjusted indices
+               Use old_lowest_slot (not self.lowest_slot) to calculate original slot numbers */
             for (old_idx, preimage) in self.bank_preimages.iter().enumerate() {
                 if let Some(preimage) = preimage {
                     let slot_for_old_idx = old_lowest_slot + old_idx as u32;
@@ -118,23 +103,33 @@ impl SolcapData {
     pub fn add_account_update(&mut self, slot: u32, update: AccountUpdate) {
         self.update_slot_range(slot);
         
-        // Add to all updates
+        /* Add to all updates */
         self.slot_account_updates_all
             .entry(slot)
             .or_insert_with(Vec::new)
             .push(update.clone());
         
-        // Add to final updates (only keep the one with highest txn_idx for each account)
+        /* Add to final updates (only keep the one with highest txn_idx for each account) */
         let final_updates = self.slot_account_updates_final
             .entry(slot)
             .or_insert_with(HashMap::new);
         
         let account_key = update.key.key;
         
-        // Only update if this is the first update for this account or has higher txn_idx
+        /* Only update if this is the first update for this account or has higher txn_idx
+           If txn_idx is None (e.g., from Agave BHD), we can't determine order, so we keep
+           whichever we see (first or last depends on insertion order) */
         if let Some(existing) = final_updates.get(&account_key) {
-            if update.txn_idx > existing.txn_idx {
-                final_updates.insert(account_key, update);
+            match (update.txn_idx, existing.txn_idx) {
+                (Some(new_idx), Some(old_idx)) if new_idx > old_idx => {
+                    final_updates.insert(account_key, update);
+                }
+                (Some(_), None) => {
+                    /* New has txn_idx, old doesn't - keep new */
+                    final_updates.insert(account_key, update);
+                }
+                /* For None vs None or None vs Some, keep existing */
+                _ => {}
             }
         } else {
             final_updates.insert(account_key, update);
@@ -185,10 +180,10 @@ impl SolcapData {
         self.slot_account_updates_final.values().map(|m| m.len()).sum()
     }
     
-    /// Merge another SolcapData into this one
-    /// This is useful for combining results from parallel processing
+    /* Merge another SolcapData into this one
+       This is useful for combining results from parallel processing */
     pub fn merge(&mut self, other: SolcapData) {
-        // Merge bank preimages
+        /* Merge bank preimages */
         for (idx, preimage) in other.bank_preimages.iter().enumerate() {
             if let Some(preimage) = preimage {
                 let slot = other.lowest_slot + idx as u32;
@@ -196,7 +191,7 @@ impl SolcapData {
             }
         }
         
-        // Merge all account updates
+        /* Merge all account updates */
         for (slot, updates) in other.slot_account_updates_all {
             for update in updates {
                 self.add_account_update(slot, update);

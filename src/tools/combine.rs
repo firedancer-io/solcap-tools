@@ -1,21 +1,18 @@
 use crate::model::structs::*;
-use crate::reader::pcap_iter::{PcapIterator, PcapIterError, DEFAULT_BUFFER_SIZE};
+use crate::reader::{SolcapReader, SolcapError, DEFAULT_BUFFER_SIZE};
+use crate::utils::{HeaderState, BlockValidation, validate_block};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use pcap_parser::PcapBlockOwned;
+use pcap_parser::traits::PcapReaderIterator;
 
 /// Errors that can occur during combining
 #[derive(Debug)]
 pub enum CombineError {
-    /// IO error
     IoError(std::io::Error),
-    /// PCAP parsing error
     PcapError(String),
-    /// Invalid file structure
     InvalidStructure(String),
-    /// No input files provided
     NoInputFiles,
 }
 
@@ -25,13 +22,12 @@ impl From<std::io::Error> for CombineError {
     }
 }
 
-impl From<PcapIterError> for CombineError {
-    fn from(err: PcapIterError) -> Self {
+impl From<SolcapError> for CombineError {
+    fn from(err: SolcapError) -> Self {
         match err {
-            PcapIterError::IoError(e) => CombineError::IoError(e),
-            PcapIterError::PcapError(e) => CombineError::PcapError(e),
-            PcapIterError::InvalidFormat(e) => CombineError::InvalidStructure(e),
-            PcapIterError::IncompleteData(e) => CombineError::InvalidStructure(e),
+            SolcapError::Io(e) => CombineError::IoError(e),
+            SolcapError::Parse(e) => CombineError::PcapError(e),
+            SolcapError::InvalidFormat(e) => CombineError::InvalidStructure(e),
         }
     }
 }
@@ -86,7 +82,7 @@ pub fn combine_solcap<P: AsRef<Path>>(
         return Err(CombineError::NoInputFiles);
     }
     
-    // Collect files with their modification times
+    /* Collect files with their modification times */
     let mut files_with_times = Vec::new();
     for path in input_paths {
         let path_ref = path.as_ref();
@@ -98,7 +94,7 @@ pub fn combine_solcap<P: AsRef<Path>>(
         });
     }
     
-    // Sort by modification time (oldest to newest)
+    /* Sort by modification time (oldest to newest) */
     files_with_times.sort_by_key(|f| f.mtime);
     
     if verbose {
@@ -109,7 +105,7 @@ pub fn combine_solcap<P: AsRef<Path>>(
         println!();
     }
     
-    // Determine output path
+    /* Determine output path */
     let output = if let Some(out) = output_path {
         out.as_ref().to_path_buf()
     } else {
@@ -118,7 +114,7 @@ pub fn combine_solcap<P: AsRef<Path>>(
     
     println!("Combining {} file(s) into: {}\n", files_with_times.len(), output.display());
     
-    // Open output file
+    /* Open output file */
     let output_file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -134,7 +130,7 @@ pub fn combine_solcap<P: AsRef<Path>>(
     let mut wrote_section_header = false;
     let mut wrote_idb = false;
     
-    // Process each file in order
+    /* Process each file in order */
     for (index, file_info) in files_with_times.iter().enumerate() {
         if verbose {
             println!("[{}/{}] Processing: {}", 
@@ -159,11 +155,11 @@ pub fn combine_solcap<P: AsRef<Path>>(
         }
     }
     
-    // Flush output
+    /* Flush output */
     buf_writer.flush()?;
     drop(buf_writer);
     
-    // Get final output size
+    /* Get final output size */
     let output_metadata = std::fs::metadata(&output)?;
     stats.output_size = output_metadata.len();
     
@@ -172,7 +168,7 @@ pub fn combine_solcap<P: AsRef<Path>>(
     Ok(stats)
 }
 
-/// Process a single input file
+/* Process a single input file */
 fn process_file<W: Write>(
     input_path: &Path,
     writer: &mut W,
@@ -184,116 +180,94 @@ fn process_file<W: Write>(
     let input_file = File::open(input_path)?;
     let buf_reader = BufReader::new(input_file);
     
-    // Create iterator - we'll use it for initialization but manually iterate for raw data access
-    let mut iterator = PcapIterator::with_buffer_size(buf_reader, DEFAULT_BUFFER_SIZE)?;
+    /* Create reader */
+    let mut solcap = SolcapReader::with_buffer_size(buf_reader, DEFAULT_BUFFER_SIZE)?;
     
     let mut epb_count = 0u64;
-    let mut seen_section_header = false;
-    let mut seen_idb = false;
+    let mut header_state = HeaderState::new();
     
-    // Manual iteration to access raw data for writing
-    use pcap_parser::traits::PcapReaderIterator;
-    let reader = iterator.reader_mut();
+    /* Use inner reader for raw block access */
+    let reader = solcap.inner_mut();
     
     loop {
+        let position = reader.position() as u64;
         let result = reader.next();
         
         match result {
             Ok((offset, block)) => {
-                match &block {
-                    PcapBlockOwned::NG(ng_block) => {
-                        use pcap_parser::pcapng::*;
-                        
-                        match ng_block {
-                            Block::SectionHeader(shb) => {
-                                seen_section_header = true;
-                                
-                                // Only write the first Section Header we encounter
-                                if !*wrote_section_header {
-                                    // Validate magic number
-                                    if shb.block_type != FD_SOLCAP_V2_FILE_MAGIC {
-                                        return Err(CombineError::InvalidStructure(
-                                            format!("Invalid magic number in {}: 0x{:08x}", 
-                                                    input_path.display(), shb.block_type)
-                                        ));
-                                    }
-                                    
-                                    // Write the raw block data
-                                    let data = reader.data();
-                                    writer.write_all(&data[..offset])?;
-                                    *wrote_section_header = true;
-                                    
-                                    if verbose {
-                                        println!("  ✓ Section Header Block");
-                                    }
-                                } else if verbose {
-                                    println!("  ⊘ Skipping duplicate Section Header");
-                                }
+                /* Validate using shared utility */
+                let validation = match validate_block(&block, &mut header_state, position) {
+                    Ok(v) => v,
+                    Err((msg, _)) => {
+                        return Err(CombineError::InvalidStructure(
+                            format!("{} in {}", msg, input_path.display())
+                        ));
+                    }
+                };
+                
+                /* Process based on validation result */
+                match validation {
+                    BlockValidation::SectionHeader => {
+                        /* Only write the first Section Header we encounter */
+                        if !*wrote_section_header {
+                            let data = reader.data();
+                            writer.write_all(&data[..offset])?;
+                            *wrote_section_header = true;
+                            
+                            if verbose {
+                                println!("  ✓ Section Header Block");
                             }
-                            Block::InterfaceDescription(_idb) => {
-                                seen_idb = true;
-                                
-                                // Only write the first IDB we encounter
-                                if !*wrote_idb {
-                                    if !*wrote_section_header {
-                                        return Err(CombineError::InvalidStructure(
-                                            format!("IDB before Section Header in {}", input_path.display())
-                                        ));
-                                    }
-                                    
-                                    // Write the raw block data
-                                    let data = reader.data();
-                                    writer.write_all(&data[..offset])?;
-                                    *wrote_idb = true;
-                                    
-                                    if verbose {
-                                        println!("  ✓ Interface Description Block");
-                                    }
-                                } else if verbose {
-                                    println!("  ⊘ Skipping duplicate IDB");
-                                }
-                            }
-                            Block::EnhancedPacket(epb) => {
-                                if !seen_section_header || !seen_idb {
-                                    return Err(CombineError::InvalidStructure(
-                                        format!("EPB before headers in {}", input_path.display())
-                                    ));
-                                }
-                                
-                                // Validate EPB has minimum data
-                                let packet_data = epb.data;
-                                if packet_data.len() < mem::size_of::<SolcapChunkIntHdr>() {
-                                    if verbose {
-                                        println!("  ⚠ Warning: Skipping invalid EPB (too small)");
-                                    }
-                                    reader.consume(offset);
-                                    continue;
-                                }
-                                
-                                // Write the raw EPB data
-                                let data = reader.data();
-                                writer.write_all(&data[..offset])?;
-                                epb_count += 1;
-                                stats.total_epb_blocks += 1;
-                                
-                                if verbose && epb_count == 1 {
-                                    println!("  ✓ First EPB block");
-                                } else if verbose && epb_count % 5000 == 0 {
-                                    println!("  ... {} EPB blocks processed", epb_count);
-                                }
-                            }
-                            _ => {
-                                // Skip other block types
-                                if verbose {
-                                    println!("  ⊘ Skipping other block type");
-                                }
-                            }
+                        } else if verbose {
+                            println!("  ⊘ Skipping duplicate Section Header");
                         }
                     }
-                    _ => {
-                        return Err(CombineError::InvalidStructure(
-                            format!("Legacy PCAP format not supported in {}", input_path.display())
-                        ));
+                    BlockValidation::InterfaceDescription => {
+                        /* Only write the first IDB we encounter */
+                        if !*wrote_idb {
+                            if !*wrote_section_header {
+                                return Err(CombineError::InvalidStructure(
+                                    format!("IDB before Section Header in {}", input_path.display())
+                                ));
+                            }
+                            
+                            let data = reader.data();
+                            writer.write_all(&data[..offset])?;
+                            *wrote_idb = true;
+                            
+                            if verbose {
+                                println!("  ✓ Interface Description Block");
+                            }
+                        } else if verbose {
+                            println!("  ⊘ Skipping duplicate IDB");
+                        }
+                    }
+                    BlockValidation::EnhancedPacket { payload_size, .. } => {
+                        /* Additional validation for minimum EPB size */
+                        if payload_size < mem::size_of::<SolcapChunkIntHdr>() {
+                            if verbose {
+                                println!("  ⚠ Warning: Skipping invalid EPB (too small)");
+                            }
+                            reader.consume(offset);
+                            continue;
+                        }
+                        
+                        /* Write the raw EPB data */
+                        let data = reader.data();
+                        writer.write_all(&data[..offset])?;
+                        epb_count += 1;
+                        stats.total_epb_blocks += 1;
+                        
+                        if verbose && epb_count == 1 {
+                            println!("  ✓ First EPB block");
+                        } else if verbose && epb_count % 5000 == 0 {
+                            println!("  ... {} EPB blocks processed", epb_count);
+                        }
+                    }
+                    BlockValidation::Other => {
+                        /* Skip other block types */
+                        if verbose {
+                            println!("  ⊘ Skipping other block type");
+                        }
                     }
                 }
                 
@@ -303,8 +277,8 @@ fn process_file<W: Write>(
                 break;
             }
             Err(pcap_parser::PcapError::Incomplete(_)) => {
-                if let Err(_) = reader.refill() {
-                    // Can't refill, reached end
+                if reader.refill().is_err() {
+                    /* Can't refill, reached end */
                     if verbose {
                         println!("  ⚠ Warning: Incomplete block at end of file, skipping");
                     }
@@ -321,7 +295,7 @@ fn process_file<W: Write>(
                     }
                     break;
                 }
-                if let Err(_) = reader.refill() {
+                if reader.refill().is_err() {
                     if verbose {
                         println!("  ⚠ Warning: Incomplete block, skipping rest of file");
                     }
@@ -344,14 +318,14 @@ fn process_file<W: Write>(
         }
     }
     
-    // Verify we got required headers from first file
-    if !seen_section_header {
+    /* Verify we got required headers from first file */
+    if !header_state.section_header_found {
         return Err(CombineError::InvalidStructure(
             format!("No Section Header found in {}", input_path.display())
         ));
     }
     
-    if !seen_idb {
+    if !header_state.idb_found {
         return Err(CombineError::InvalidStructure(
             format!("No Interface Description Block found in {}", input_path.display())
         ));
@@ -370,4 +344,3 @@ mod tests {
         assert!(matches!(result, Err(CombineError::NoInputFiles)));
     }
 }
-

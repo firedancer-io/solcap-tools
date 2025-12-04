@@ -1,5 +1,5 @@
 use clap::{Arg, Command};
-use solcap_tools::tools::{print_solcap_info, diff_solcap, explore_solcap, compare_solcap, verify_solcap, cleanup_solcap, combine_solcap};
+use solcap_tools::tools::{print_solcap_info, diff_solcap, compare_solcap, verify_solcap, combine_solcap};
 
 fn main() {
     let matches = Command::new("solcap-tools")
@@ -68,9 +68,9 @@ fn main() {
                         .short('v')
                         .long("verbosity")
                         .value_name("LEVEL")
-                        .help("Verbosity level (1-4): 1=bank hash only, 2=full preimage, 3=+account counts, 4=+account details")
+                        .help("Verbosity level (1-5): 1=bank hash only, 2=full preimage, 3=+account counts, 4=+account details, 5=+data comparison")
                         .default_value("2")
-                        .value_parser(clap::value_parser!(u8).range(1..=4)),
+                        .value_parser(clap::value_parser!(u8).range(1..=5)),
                 )
                 .arg(
                     Arg::new("start-slot")
@@ -85,17 +85,6 @@ fn main() {
                         .value_name("SLOT")
                         .help("Ending slot to compare (inclusive)")
                         .value_parser(clap::value_parser!(u32)),
-                )
-        )
-        .subcommand(
-            Command::new("explore")
-                .about("Interactively explore a solcap file")
-                .arg(
-                    Arg::new("file")
-                        .value_name("FILE")
-                        .help("The solcap file to explore")
-                        .required(true)
-                        .index(1),
                 )
         )
         .subcommand(
@@ -118,7 +107,7 @@ fn main() {
         )
         .subcommand(
             Command::new("verify")
-                .about("Verify that a solcap file or directory of solcap files is correctly formatted")
+                .about("Verify a solcap file is correctly formatted. Use -o to output a cleaned version.")
                 .arg(
                     Arg::new("file")
                         .value_name("PATH")
@@ -133,23 +122,14 @@ fn main() {
                         .action(clap::ArgAction::SetTrue)
                         .help("Enable verbose output with detailed verification information"),
                 )
-        )
-        .subcommand(
-            Command::new("cleanup")
-                .about("Clean up a corrupted solcap file by removing incomplete/malformed blocks")
                 .arg(
-                    Arg::new("file")
-                        .value_name("FILE")
-                        .help("The solcap file to clean up")
-                        .required(true)
-                        .index(1),
-                )
-                .arg(
-                    Arg::new("verbose")
-                        .short('v')
-                        .long("verbose")
-                        .action(clap::ArgAction::SetTrue)
-                        .help("Enable verbose output showing detailed cleanup process"),
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("OUTPUT")
+                        .num_args(0..=1)
+                        .default_missing_value("")
+                        .help("Output cleaned solcap file (removes invalid/incomplete blocks). If no path given, outputs to <input>_clean.solcap"),
                 )
         )
         .subcommand(
@@ -207,14 +187,6 @@ fn main() {
                 }
             }
         }
-        Some(("explore", sub_matches)) => {
-            if let Some(file) = sub_matches.get_one::<String>("file") {
-                if let Err(e) = explore_solcap(file) {
-                    eprintln!("Error: {:?}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
         Some(("compare", sub_matches)) => {
             if let (Some(path1), Some(path2)) = (
                 sub_matches.get_one::<String>("path1"),
@@ -229,11 +201,16 @@ fn main() {
         Some(("verify", sub_matches)) => {
             if let Some(file) = sub_matches.get_one::<String>("file") {
                 let verbose = sub_matches.get_flag("verbose");
-                match verify_solcap(file, verbose) {
-                    Ok(_stats) => {
-                        // Success message is printed by verify_solcap when verbose
+                let output = sub_matches.get_one::<String>("output").cloned();
+                
+                match verify_solcap(file, verbose, output.as_ref()) {
+                    Ok(stats) => {
                         if !verbose {
-                            println!("✓ File is valid");
+                            if stats.output_path.is_some() {
+                                println!("✓ File verified and cleaned output written");
+                            } else {
+                                println!("✓ File is valid");
+                            }
                         }
                         std::process::exit(0);
                     }
@@ -244,28 +221,50 @@ fn main() {
                 }
             }
         }
-        Some(("cleanup", sub_matches)) => {
-            if let Some(file) = sub_matches.get_one::<String>("file") {
-                let verbose = sub_matches.get_flag("verbose");
-                match cleanup_solcap(file, verbose) {
-                    Ok(_stats) => {
-                        std::process::exit(0);
-                    }
-                    Err(e) => {
-                        eprintln!("✗ Cleanup failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
         Some(("combine", sub_matches)) => {
-            let files: Vec<String> = sub_matches
+            let input_args: Vec<String> = sub_matches
                 .get_many::<String>("files")
                 .unwrap()
                 .map(|s| s.to_string())
                 .collect();
             let output = sub_matches.get_one::<String>("output").cloned();
             let verbose = sub_matches.get_flag("verbose");
+            
+            /* Expand directories to find .solcap files */
+            let mut files = Vec::new();
+            for path_str in input_args {
+                let path = std::path::Path::new(&path_str);
+                if path.is_dir() {
+                    /* Collect all .solcap files in the directory */
+                    match std::fs::read_dir(path) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                if let Ok(entry) = entry {
+                                    let entry_path = entry.path();
+                                    if entry_path.is_file() {
+                                        if let Some(ext) = entry_path.extension() {
+                                            if ext == "solcap" {
+                                                files.push(entry_path.to_string_lossy().to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("✗ Error reading directory {}: {}", path_str, e);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    files.push(path_str);
+                }
+            }
+            
+            if files.is_empty() {
+                eprintln!("✗ No .solcap files found in the specified paths");
+                std::process::exit(1);
+            }
             
             match combine_solcap(&files, output, verbose) {
                 Ok(_stats) => {
@@ -283,12 +282,12 @@ fn main() {
             println!("\nExamples:");
             println!("  solcap-tools print input.solcap");
             println!("  solcap-tools diff file1.solcap file2.solcap");
-            println!("  solcap-tools explore input.solcap");
             println!("  solcap-tools compare file1.solcap file2.solcap");
             println!("  solcap-tools verify input.solcap");
+            println!("  solcap-tools verify input.solcap -o              # output to input_clean.solcap");
+            println!("  solcap-tools verify input.solcap -o cleaned.solcap");
             println!("  solcap-tools verify /path/to/directory");
-            println!("  solcap-tools cleanup corrupted.solcap");
-            println!("  solcap-tools combine file1.solcap file2.solcap file3.solcap -o merged.solcap");
+            println!("  solcap-tools combine file1.solcap file2.solcap -o merged.solcap");
         }
     }
 }

@@ -72,7 +72,7 @@ struct UpdateComparison {
 /// Circular buffer for caching
 struct CircularCache<T> {
     capacity: usize,
-    items: VecDeque<(String, T)>, // (key, value)
+    items: VecDeque<(String, T)>, /* (key, value) */
 }
 
 impl<T: Clone> CircularCache<T> {
@@ -90,13 +90,13 @@ impl<T: Clone> CircularCache<T> {
     }
 
     fn insert(&mut self, key: String, value: T) {
-        // Remove if already exists
+        /* Remove if already exists */
         self.items.retain(|(k, _)| k != &key);
         
-        // Add new item
+        /* Add new item */
         self.items.push_front((key, value));
         
-        // Trim if over capacity
+        /* Trim if over capacity */
         if self.items.len() > self.capacity {
             self.items.pop_back();
         }
@@ -109,6 +109,8 @@ struct App {
     data2: SolcapData,
     path1: PathBuf,
     path2: PathBuf,
+    name1: String,
+    name2: String,
     level: ViewLevel,
     list_state: ListState,
     slots: Vec<SlotInfo>,
@@ -116,7 +118,11 @@ struct App {
     page_size: usize,
     hex_scroll_offset: usize,
     
-    // Circular caches
+    /* Saved selection positions for navigation */
+    saved_slot_selection: Option<usize>,
+    saved_account_selection: Option<usize>,
+    
+    /* Circular caches */
     account_cache: CircularCache<Vec<AccountInfo>>,
     update_cache: CircularCache<Vec<UpdateComparison>>,
     data_cache: CircularCache<(Option<Vec<u8>>, Option<Vec<u8>>)>,
@@ -125,12 +131,24 @@ struct App {
     current_cached_account: Option<[u8; 32]>,
 }
 
+/// Extract display name from a path (file name or folder name)
+fn get_display_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 impl App {
     fn new(data1: SolcapData, data2: SolcapData, path1: PathBuf, path2: PathBuf) -> Self {
-        // Build slot info list
+        /* Get display names from paths */
+        let name1 = get_display_name(&path1);
+        let name2 = get_display_name(&path2);
+        
+        /* Build slot info list */
         let mut slot_set = HashSet::new();
         
-        // Collect all slots from both sources
+        /* Collect all slots from both sources */
         for slot in data1.slot_account_updates_final.keys() {
             slot_set.insert(*slot);
         }
@@ -138,7 +156,7 @@ impl App {
             slot_set.insert(*slot);
         }
         
-        // Convert to sorted vec with metadata
+        /* Convert to sorted vec with metadata */
         let mut slots: Vec<SlotInfo> = slot_set.into_iter().map(|slot| {
             let preimage1 = data1.get_bank_preimage(slot);
             let preimage2 = data2.get_bank_preimage(slot);
@@ -153,7 +171,7 @@ impl App {
                 (true, true) => Source::Both,
                 (true, false) => Source::SourceOne,
                 (false, true) => Source::SourceTwo,
-                (false, false) => Source::Both, // Shouldn't happen
+                (false, false) => Source::Both, /* Shouldn't happen */
             };
             
             let has_diff = match (bank_hash_1, bank_hash_2) {
@@ -184,12 +202,16 @@ impl App {
             data2,
             path1,
             path2,
+            name1,
+            name2,
             level: ViewLevel::SlotLevel,
             list_state,
             slots,
             should_quit: false,
             page_size: 20,
             hex_scroll_offset: 0,
+            saved_slot_selection: None,
+            saved_account_selection: None,
             account_cache: CircularCache::new(20),
             update_cache: CircularCache::new(20),
             data_cache: CircularCache::new(10),
@@ -213,15 +235,23 @@ impl App {
     fn go_back(&mut self) {
         match &self.level {
             ViewLevel::SlotLevel => {
-                // At top level, do nothing (or could quit)
+                /* At top level, do nothing (or could quit) */
             }
             ViewLevel::AccountLevel { .. } => {
                 self.level = ViewLevel::SlotLevel;
                 self.hex_scroll_offset = 0;
+                /* Restore slot selection */
+                if let Some(idx) = self.saved_slot_selection {
+                    self.list_state.select(Some(idx));
+                }
             }
             ViewLevel::UpdateLevel { slot, .. } => {
                 self.level = ViewLevel::AccountLevel { slot: *slot };
                 self.hex_scroll_offset = 0;
+                /* Restore account selection */
+                if let Some(idx) = self.saved_account_selection {
+                    self.list_state.select(Some(idx));
+                }
             }
         }
     }
@@ -336,6 +366,8 @@ impl App {
             ViewLevel::SlotLevel => {
                 if let Some(idx) = self.list_state.selected() {
                     if idx < self.slots.len() {
+                        /* Save slot selection before drilling down */
+                        self.saved_slot_selection = Some(idx);
                         let slot = self.slots[idx].slot;
                         self.cache_accounts(slot);
                         self.level = ViewLevel::AccountLevel { slot };
@@ -349,6 +381,8 @@ impl App {
                     let cache_key = format!("slot_{}", slot);
                     if let Some(accounts) = self.account_cache.get(&cache_key) {
                         if idx < accounts.len() {
+                            /* Save account selection before drilling down */
+                            self.saved_account_selection = Some(idx);
                             let account = accounts[idx].account;
                             self.cache_updates(slot, &account);
                             self.level = ViewLevel::UpdateLevel { slot, account };
@@ -358,7 +392,7 @@ impl App {
                 }
             }
             ViewLevel::UpdateLevel { .. } => {
-                // At deepest level, nothing to drill down to
+                /* At deepest level, nothing to drill down to */
             }
         }
     }
@@ -366,14 +400,14 @@ impl App {
     fn cache_accounts(&mut self, slot: u32) {
         let cache_key = format!("slot_{}", slot);
         
-        // Check if already cached
+        /* Check if already cached */
         if self.account_cache.get(&cache_key).is_some() {
             return;
         }
 
         let mut account_set = HashSet::new();
         
-        // Collect accounts from both sources
+        /* Collect accounts from both sources */
         if let Some(updates) = self.data1.get_account_updates_final(slot) {
             for key in updates.keys() {
                 account_set.insert(*key);
@@ -385,7 +419,7 @@ impl App {
             }
         }
         
-        // Convert to sorted vec with metadata
+        /* Convert to sorted vec with metadata */
         let mut accounts: Vec<AccountInfo> = account_set.into_iter().map(|account| {
             let updates1 = self.data1.get_account_updates_final(slot)
                 .and_then(|u| u.get(&account));
@@ -403,10 +437,10 @@ impl App {
                 (true, true) => Source::Both,
                 (true, false) => Source::SourceOne,
                 (false, true) => Source::SourceTwo,
-                (false, false) => Source::Both, // Shouldn't happen
+                (false, false) => Source::Both, /* Shouldn't happen */
             };
             
-            // Check if there's a difference in final values
+            /* Check if there's a difference in final values */
             let has_diff = match (updates1, updates2) {
                 (Some(u1), Some(u2)) => {
                     u1.meta.lamports != u2.meta.lamports ||
@@ -426,8 +460,20 @@ impl App {
             }
         }).collect();
         
-        // Sort by has_diff first (true comes first), then by account for stable ordering
-        accounts.sort_by_key(|a| (!a.has_diff, a.account));
+        /* Sort: differences first, then by base58 address */
+        accounts.sort_by(|a, b| {
+            /* First sort by has_diff (true comes before false) */
+            match (a.has_diff, b.has_diff) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                /* If both have same diff status, sort by base58 address */
+                _ => {
+                    let a_str = bs58::encode(&a.account).into_string();
+                    let b_str = bs58::encode(&b.account).into_string();
+                    a_str.cmp(&b_str)
+                }
+            }
+        });
         
         self.account_cache.insert(cache_key, accounts);
         self.current_cached_slot = Some(slot);
@@ -436,20 +482,20 @@ impl App {
     fn cache_updates(&mut self, slot: u32, account: &[u8; 32]) {
         let cache_key = format!("slot_{}_account_{}", slot, bs58::encode(account).into_string());
         
-        // Check if already cached
+        /* Check if already cached */
         if self.update_cache.get(&cache_key).is_some() {
             return;
         }
 
-        // Get final updates from both sources
+        /* Get final updates from both sources */
         let update1 = self.data1.get_account_updates_final(slot)
             .and_then(|u| u.get(account));
         let update2 = self.data2.get_account_updates_final(slot)
             .and_then(|u| u.get(account));
         
         let comparison = UpdateComparison {
-            txn_idx_1: update1.map(|u| u.txn_idx),
-            txn_idx_2: update2.map(|u| u.txn_idx),
+            txn_idx_1: update1.and_then(|u| u.txn_idx),
+            txn_idx_2: update2.and_then(|u| u.txn_idx),
             lamports_1: update1.map(|u| u.meta.lamports),
             lamports_2: update2.map(|u| u.meta.lamports),
             owner_1: update1.map(|u| u.meta.owner.key),
@@ -471,25 +517,25 @@ impl App {
         self.update_cache.insert(cache_key, vec![comparison]);
         self.current_cached_account = Some(*account);
         
-        // Also cache the actual account data for hex display
+        /* Also cache the actual account data for hex display */
         self.cache_account_data(slot, account);
     }
 
     fn cache_account_data(&mut self, slot: u32, account: &[u8; 32]) {
         let cache_key = format!("data_slot_{}_account_{}", slot, bs58::encode(account).into_string());
         
-        // Check if already cached
+        /* Check if already cached */
         if self.data_cache.get(&cache_key).is_some() {
             return;
         }
 
-        // Get final updates from both sources
+        /* Get final updates from both sources */
         let update1 = self.data1.get_account_updates_final(slot)
             .and_then(|u| u.get(account));
         let update2 = self.data2.get_account_updates_final(slot)
             .and_then(|u| u.get(account));
         
-        // Read data from both sources
+        /* Read data from both sources */
         let data1 = update1.and_then(|u| {
             if u.file.is_some() {
                 read_account_data_from_bhd(u).ok()
@@ -516,7 +562,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(f.size());
 
-    // Header based on current level
+    /* Header based on current level */
     let header = match &app.level {
         ViewLevel::SlotLevel => {
             let text = format!(
@@ -549,7 +595,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     };
     f.render_widget(header, chunks[0]);
 
-    // Main content based on level
+    /* Main content based on level */
     let level = app.level.clone();
     match level {
         ViewLevel::SlotLevel => render_slot_level(f, app, chunks[1]),
@@ -563,7 +609,13 @@ fn ui(f: &mut Frame, app: &mut App) {
 fn render_slot_level(f: &mut Frame, app: &mut App, area: Rect) {
     app.page_size = (area.height.saturating_sub(5)) as usize;
 
-    let header_text = "SLOT             │ BANK HASH (Source 1)                        │ BANK HASH (Source 2)                        │ ACCTS(1) │ ACCTS(2)";
+    /* Truncate names to fit in column headers */
+    let name1_short = if app.name1.len() > 20 { &app.name1[..20] } else { &app.name1 };
+    let name2_short = if app.name2.len() > 20 { &app.name2[..20] } else { &app.name2 };
+    let header_text = format!(
+        "SLOT             │ BANK HASH ({:20})             │ BANK HASH ({:20})             │ ACCTS({}) │ ACCTS({})",
+        name1_short, name2_short, name1_short, name2_short
+    );
 
     let items: Vec<ListItem> = app.slots.iter().map(|slot_info| {
         let bank_hash_1 = slot_info.bank_hash_1
@@ -577,7 +629,7 @@ fn render_slot_level(f: &mut Frame, app: &mut App, area: Rect) {
         let acct_1_str = format!("{:>6}", slot_info.account_count_1);
         let acct_2_str = format!("{:>6}", slot_info.account_count_2);
 
-        // Color based on source and differences
+        /* Color based on source and differences */
         let (slot_color, hash_color) = if slot_info.has_diff {
             (Color::Red, Color::Red)
         } else if slot_info.source != Source::Both {
@@ -605,7 +657,7 @@ fn render_slot_level(f: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(
-                header_text,
+                header_text.clone(),
                 Style::default().add_modifier(Modifier::BOLD)
             )))
         .highlight_style(
@@ -619,14 +671,20 @@ fn render_slot_level(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_account_level(f: &mut Frame, app: &mut App, slot: u32, area: Rect) {
-    // Ensure accounts are cached
+    /* Ensure accounts are cached */
     if app.current_cached_slot != Some(slot) {
         app.cache_accounts(slot);
     }
 
     app.page_size = (area.height.saturating_sub(3)) as usize;
 
-    let header_text = "ACCOUNT                                       │ UPD(1) │ UPD(2)";
+    /* Truncate names to fit in column headers */
+    let name1_short = if app.name1.len() > 10 { &app.name1[..10] } else { &app.name1 };
+    let name2_short = if app.name2.len() > 10 { &app.name2[..10] } else { &app.name2 };
+    let header_text = format!(
+        "ACCOUNT                                       │ ({}) │ ({})",
+        name1_short, name2_short
+    );
     
     let cache_key = format!("slot_{}", slot);
     let items: Vec<ListItem> = if let Some(accounts) = app.account_cache.get(&cache_key) {
@@ -661,7 +719,7 @@ fn render_account_level(f: &mut Frame, app: &mut App, slot: u32, area: Rect) {
         .block(Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(
-                header_text,
+                header_text.clone(),
                 Style::default().add_modifier(Modifier::BOLD)
             )))
         .highlight_style(
@@ -675,13 +733,13 @@ fn render_account_level(f: &mut Frame, app: &mut App, slot: u32, area: Rect) {
 }
 
 fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 32], area: Rect) {
-    // Split into info section and data comparison
+    /* Split into info section and data comparison */
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(14), Constraint::Min(0)])
+        .constraints([Constraint::Length(10), Constraint::Min(0)])
         .split(area);
 
-    // Get cached update comparison
+    /* Get cached update comparison */
     let cache_key = format!("slot_{}_account_{}", slot, bs58::encode(account).into_string());
     
     let update_info = if let Some(comparisons) = app.update_cache.get(&cache_key) {
@@ -691,7 +749,7 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
                 Line::from(""),
             ];
             
-            // Transaction indices
+            /* Transaction indices */
             let txn_color = if comp.has_diff { Color::Red } else { Color::Green };
             lines.push(Line::from(vec![
                 Span::raw("Transaction Index:  "),
@@ -706,7 +764,7 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
                 ),
             ]));
             
-            // Lamports
+            /* Lamports */
             let lamp_diff = match (comp.lamports_1, comp.lamports_2) {
                 (Some(l1), Some(l2)) => l1 != l2,
                 _ => true,
@@ -724,7 +782,7 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
                 ),
             ]));
             
-            // Owner
+            /* Owner */
             let owner_diff = match (comp.owner_1, comp.owner_2) {
                 (Some(o1), Some(o2)) => o1 != o2,
                 _ => true,
@@ -732,19 +790,17 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
             lines.push(Line::from(vec![
                 Span::raw("Owner:              "),
                 Span::styled(
-                    format!("{:>44}", comp.owner_1.map(|o| bs58::encode(&o).into_string()).unwrap_or_else(|| "N/A".to_string())),
+                    format!("{:44}", comp.owner_1.map(|o| bs58::encode(&o).into_string()).unwrap_or_else(|| "N/A".to_string())),
                     Style::default().fg(if owner_diff && comp.owner_1.is_some() { Color::Red } else if comp.owner_1.is_some() { Color::Cyan } else { Color::DarkGray })
                 ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw("                    "),
+                Span::raw("  │  "),
                 Span::styled(
-                    format!("{:>44}", comp.owner_2.map(|o| bs58::encode(&o).into_string()).unwrap_or_else(|| "N/A".to_string())),
+                    format!("{:44}", comp.owner_2.map(|o| bs58::encode(&o).into_string()).unwrap_or_else(|| "N/A".to_string())),
                     Style::default().fg(if owner_diff && comp.owner_2.is_some() { Color::Red } else if comp.owner_2.is_some() { Color::Cyan } else { Color::DarkGray })
                 ),
             ]));
             
-            // Data size
+            /* Data size */
             let data_diff = match (comp.data_size_1, comp.data_size_2) {
                 (Some(d1), Some(d2)) => d1 != d2,
                 _ => true,
@@ -774,14 +830,14 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
         .block(Block::default().borders(Borders::ALL).title("Update Comparison"));
     f.render_widget(info_widget, chunks[0]);
 
-    // Render hex dump comparison
+    /* Render hex dump comparison */
     render_hex_dump_comparison(f, app, slot, account, chunks[1]);
 }
 
 fn render_hex_dump_comparison(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 32], area: Rect) {
     let cache_key = format!("data_slot_{}_account_{}", slot, bs58::encode(account).into_string());
     
-    // Split area into two columns
+    /* Split area into two columns */
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -790,16 +846,16 @@ fn render_hex_dump_comparison(f: &mut Frame, app: &mut App, slot: u32, account: 
     app.page_size = (area.height.saturating_sub(2)) as usize;
 
     if let Some((data1, data2)) = app.data_cache.get(&cache_key) {
-        // Render left side (Source 1) with comparison highlighting
+        /* Render left side with comparison highlighting */
         let lines1 = render_hex_data_with_diff(data1.as_ref(), data2.as_ref(), app.hex_scroll_offset, app.page_size, true);
         let hex_widget1 = Paragraph::new(lines1)
-            .block(Block::default().borders(Borders::ALL).title("Source 1 Data"));
+            .block(Block::default().borders(Borders::ALL).title(app.name1.clone()));
         f.render_widget(hex_widget1, columns[0]);
 
-        // Render right side (Source 2) with comparison highlighting
+        /* Render right side with comparison highlighting */
         let lines2 = render_hex_data_with_diff(data2.as_ref(), data1.as_ref(), app.hex_scroll_offset, app.page_size, false);
         let hex_widget2 = Paragraph::new(lines2)
-            .block(Block::default().borders(Borders::ALL).title("Source 2 Data"));
+            .block(Block::default().borders(Borders::ALL).title(app.name2.clone()));
         f.render_widget(hex_widget2, columns[1]);
     } else {
         let loading_widget = Paragraph::new(Line::from("Loading..."))
@@ -838,7 +894,7 @@ fn render_hex_data_with_diff(
                 let row_end = (offset + bytes_per_row).min(data.len());
                 let row_data = &data[offset..row_end];
                 
-                // Build the line with colored spans for differences
+                /* Build the line with colored spans for differences */
                 let mut spans = vec![
                     Span::styled(
                         format!("{:08X}  ", offset),
@@ -851,16 +907,16 @@ fn render_hex_data_with_diff(
                         spans.push(Span::raw(" "));
                     }
                     
-                    // Check if this byte differs from the other source
+                    /* Check if this byte differs from the other source */
                     let differs = if let Some(other) = other_data {
                         let other_idx = offset + i;
                         if other_idx < other.len() {
                             other[other_idx] != *byte
                         } else {
-                            true // Different if other data doesn't have this byte
+                            true /* Different if other data doesn't have this byte */
                         }
                     } else {
-                        false // No other data to compare with
+                        false /* No other data to compare with */
                     };
                     
                     let color = if differs { Color::Red } else { Color::White };
@@ -885,7 +941,7 @@ fn render_hex_data_with_diff(
     }
 }
 
-/// Parse a path (either a file or directory) into SolcapData
+/* Parse a path (either a file or directory) into SolcapData */
 fn parse_path<P: AsRef<Path>>(path: P) -> Result<SolcapData, CompareError> {
     let path = path.as_ref();
 
@@ -936,7 +992,7 @@ impl From<std::io::Error> for CompareError {
     }
 }
 
-/// Run the interactive comparison
+/* Run the interactive comparison */
 pub fn compare_solcap<P1: AsRef<Path>, P2: AsRef<Path>>(
     path1: P1,
     path2: P2,
@@ -944,16 +1000,20 @@ pub fn compare_solcap<P1: AsRef<Path>, P2: AsRef<Path>>(
     let path1 = path1.as_ref();
     let path2 = path2.as_ref();
 
-    // Read both paths
-    println!("Loading source 1: {}", path1.display());
+    /* Get display names for the sources */
+    let name1 = get_display_name(path1);
+    let name2 = get_display_name(path2);
+
+    /* Read both paths */
+    println!("Loading '{}': {}", name1, path1.display());
     let data1 = parse_path(path1)?;
     println!("  Slots: {} - {}", data1.lowest_slot, data1.highest_slot);
 
-    println!("Loading source 2: {}", path2.display());
+    println!("Loading '{}': {}", name2, path2.display());
     let data2 = parse_path(path2)?;
     println!("  Slots: {} - {}", data2.lowest_slot, data2.highest_slot);
 
-    // Setup terminal
+    /* Setup terminal */
     enable_raw_mode().map_err(|e| {
         CompareError::IoError(e)
     })?;
@@ -966,11 +1026,11 @@ pub fn compare_solcap<P1: AsRef<Path>, P2: AsRef<Path>>(
         CompareError::IoError(e)
     })?;
 
-    // Create app and run
+    /* Create app and run */
     let mut app = App::new(data1, data2, path1.to_path_buf(), path2.to_path_buf());
     let res = run_app(&mut terminal, &mut app);
 
-    // Restore terminal
+    /* Restore terminal */
     disable_raw_mode().map_err(|e| {
         CompareError::IoError(e)
     })?;

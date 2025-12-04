@@ -34,17 +34,17 @@ pub fn print_solcap_info(
             println!("Total Account Updates (All): {}", data.total_account_updates());
             println!("Total Account Updates (Final): {}", data.total_account_updates_final());
             
-            // Print bank preimages count
+            /* Print bank preimages count */
             let bank_preimage_count = data.bank_preimages.iter()
                 .filter(|p| p.is_some())
                 .count();
             println!("Bank Preimages: {}", bank_preimage_count);
             
-            // Print detailed slot information based on verbosity
+            /* Print detailed slot information based on verbosity */
             if data.slot_count() > 0 {
                 println!("\n=== Slot Details ===");
                 
-                // Get sorted list of slots
+                /* Get sorted list of slots */
                 let mut slots_with_data: Vec<u32> = data.bank_preimages.iter()
                     .enumerate()
                     .filter_map(|(idx, p)| {
@@ -56,7 +56,7 @@ pub fn print_solcap_info(
                     })
                     .collect();
                 
-                // Also include slots with account updates
+                /* Also include slots with account updates */
                 for slot in data.slot_account_updates_all.keys() {
                     if !slots_with_data.contains(slot) {
                         slots_with_data.push(*slot);
@@ -64,7 +64,7 @@ pub fn print_solcap_info(
                 }
                 slots_with_data.sort();
                 
-                // Filter slots based on start_slot and end_slot parameters
+                /* Filter slots based on start_slot and end_slot parameters */
                 let filtered_slots: Vec<u32> = slots_with_data.into_iter()
                     .filter(|slot| {
                         if let Some(start) = start_slot {
@@ -84,7 +84,7 @@ pub fn print_solcap_info(
                 for slot in filtered_slots {
                     println!("\nSlot {}:", slot);
                     
-                    // Print bank preimage based on verbosity
+                    /* Print bank preimage based on verbosity */
                     if let Some(preimage) = data.get_bank_preimage(slot) {
                         if verbosity >= 1 {
                             println!("  Bank Hash: {}", bs58::encode(preimage.bank_hash.hash).into_string());
@@ -102,9 +102,9 @@ pub fn print_solcap_info(
                         }
                     }
                     
-                    // Print account updates if verbosity >= 3
+                    /* Print account updates if verbosity >= 3 */
                     if verbosity >= 3 {
-                        // Determine which updates to show based on flag
+                        /* Determine which updates to show based on flag */
                         let (updates_label, updates_iter): (&str, Box<dyn Iterator<Item = &crate::reader::structures::AccountUpdate>>) = 
                             if show_all_updates {
                                 ("All Account Updates", 
@@ -120,7 +120,7 @@ pub fn print_solcap_info(
                                      .flatten()))
                             };
                         
-                        // Collect updates to check if empty
+                        /* Collect updates to check if empty */
                         let updates: Vec<_> = updates_iter.collect();
                         if !updates.is_empty() {
                             println!("  {}:", updates_label);
@@ -136,9 +136,9 @@ pub fn print_solcap_info(
                                 println!("      Owner: {}", bs58::encode(owner).into_string());
                                 println!("      Executable: {}", executable);
                                 println!("      Data Size: {} bytes", update.data_size);
-                                println!("      Transaction Index: {}", update.txn_idx);
+                                println!("      Transaction Index: {}", update.txn_idx.map(|t| t.to_string()).unwrap_or_else(|| "N/A".to_string()));
                                 
-                                // Print account data if verbosity >= 4
+                                /* Print account data if verbosity >= 4 */
                                 if verbosity >= 4 && update.data_size > 0 {
                                     if let Ok(account_data) = read_account_data(file_path, update.data_offset, update.data_size) {
                                         println!("      Data: {}", hex::encode(&account_data));

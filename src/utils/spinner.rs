@@ -43,33 +43,32 @@ impl Spinner {
         }
     }
 
-     /* Stop the spinner, clear it, and print follow-up lines
-        The original message line stays (without spinner), and
-        additional lines are printed below
+    /* Stop the spinner, clear it, and print follow-up lines
+       The original message line stays (without spinner), and
+       additional lines are printed below
         
-        Example:
-        ```
-        let spinner = Spinner::new("Loading data");
-        // Shows: "Loading data ⠋"
-        // ... do work ...
-        spinner.finish_with_lines(vec!["  Complete!", "  Done in 5s"]);
-        // Shows: "Loading data"
-        //        "  Complete!"
-        //        "  Done in 5s"
-        ```
-    */
+       Example:
+       ```
+       let spinner = Spinner::new("Loading data");
+       /* Shows: "Loading data ⠋" */
+       /* ... do work ... */
+       spinner.finish_with_lines(vec!["  Complete!", "  Done in 5s"]);
+       /* Shows: "Loading data"
+                 "  Complete!"
+                 "  Done in 5s" */
+       ``` */
     pub fn finish_with_lines(mut self, follow_up_lines: Vec<&str>) {
         self.should_stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
         if let Ok(pb) = self.progress_bar.lock() {
-            // Get the original message to reprint it with a checkmark
+            /* Get the original message to reprint it with a checkmark */
             let message = pb.message();
             pb.finish_and_clear();
-            // Print original message with green checkmark instead of spinner
+            /* Print original message with green checkmark instead of spinner */
             println!("✓ {}", message);
-            // Print follow-up lines
+            /* Print follow-up lines */
             for line in follow_up_lines {
                 println!("{}", line);
             }

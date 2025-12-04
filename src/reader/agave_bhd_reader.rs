@@ -58,7 +58,7 @@ pub struct AgaveAccountEntry {
     pub owner: String,
     pub lamports: u64,
     pub executable: bool,
-    pub data: String, // base64 encoded
+    pub data: String, /* base64 encoded */
 }
 
 /// Reader for Agave bank hash details directories
@@ -88,7 +88,7 @@ impl AgaveBhdReader {
     /// Parse all JSON files in the directory and build in-memory structures
     /// Uses parallelization to process multiple files simultaneously
     pub fn parse_directory(&self) -> Result<SolcapData, AgaveBhdReaderError> {
-        // Collect all JSON file paths first
+        /* Collect all JSON file paths first */
         let entries = fs::read_dir(&self.directory_path)?;
         let mut json_files = Vec::new();
         
@@ -96,7 +96,7 @@ impl AgaveBhdReader {
             let entry = entry?;
             let path = entry.path();
             
-            // Only process .json files
+            /* Only process .json files */
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 json_files.push(path);
             }
@@ -106,20 +106,20 @@ impl AgaveBhdReader {
             return Ok(SolcapData::new());
         }
         
-        // Determine number of threads to use (cap at number of files or CPU count)
+        /* Determine number of threads to use (cap at number of files or CPU count) */
         let num_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
             .min(json_files.len());
         
-        // Split files into chunks for each thread
+        /* Split files into chunks for each thread */
         let chunk_size = (json_files.len() + num_threads - 1) / num_threads;
         let file_chunks: Vec<Vec<_>> = json_files
             .chunks(chunk_size)
             .map(|chunk| chunk.to_vec())
             .collect();
         
-        // Process file chunks in parallel using scoped threads
+        /* Process file chunks in parallel using scoped threads */
         let results = std::thread::scope(|s| {
             let handles: Vec<_> = file_chunks
                 .into_iter()
@@ -136,13 +136,13 @@ impl AgaveBhdReader {
                 })
                 .collect();
             
-            // Collect results from all threads
+            /* Collect results from all threads */
             handles.into_iter()
                 .map(|h| h.join().unwrap())
                 .collect::<Vec<_>>()
         });
         
-        // Merge all results
+        /* Merge all results */
         let mut final_data = SolcapData::new();
         for data in results {
             final_data.merge(data);
@@ -156,13 +156,13 @@ impl AgaveBhdReader {
         path: &Path,
         data: &mut SolcapData,
     ) -> Result<(), AgaveBhdReaderError> {
-        // Read the file
+        /* Read the file */
         let contents = fs::read_to_string(path)?;
 
-        // Parse JSON
+        /* Parse JSON */
         let bhd: AgaveBankHashDetails = serde_json::from_str(&contents)?;
 
-        // Process each bank hash detail entry
+        /* Process each bank hash detail entry */
         for entry in bhd.bank_hash_details {
             Self::process_bank_hash_entry(&entry, data, path)?;
         }
@@ -178,7 +178,7 @@ impl AgaveBhdReader {
     ) -> Result<(), AgaveBhdReaderError> {
         let slot = entry.slot;
 
-        // Parse and add bank preimage
+        /* Parse and add bank preimage */
         let bank_preimage = crate::model::structs::SolcapBankPreimage {
             bank_hash: Self::parse_hash(&entry.bank_hash)?,
             prev_bank_hash: Self::parse_hash(&entry.parent_bank_hash)?,
@@ -188,12 +188,11 @@ impl AgaveBhdReader {
         };
         data.add_bank_preimage(slot, bank_preimage);
 
-        // Process accounts
-        for (idx, account) in entry.accounts.iter().enumerate() {
+        /* Process accounts */
+        for account in entry.accounts.iter() {
             let account_update = Self::parse_account_entry(
                 account,
                 slot,
-                idx as u64,
                 source_file,
             )?;
             data.add_account_update(slot, account_update);
@@ -206,16 +205,15 @@ impl AgaveBhdReader {
     fn parse_account_entry(
         account: &AgaveAccountEntry,
         slot: u32,
-        txn_idx: u64,
         source_file: &Path,
     ) -> Result<crate::reader::structures::AccountUpdate, AgaveBhdReaderError> {
-        // Parse pubkey
+        /* Parse pubkey */
         let key = Self::parse_pubkey(&account.pubkey)?;
 
-        // Parse owner
+        /* Parse owner */
         let owner = Self::parse_pubkey(&account.owner)?;
 
-        // Create account metadata
+        /* Create account metadata */
         let meta = SolanaAccountMeta {
             lamports: account.lamports,
             owner,
@@ -223,31 +221,30 @@ impl AgaveBhdReader {
             padding: [0; 3],
         };
 
-        // Decode base64 data to get size
+        /* Decode base64 data to get size */
         let data_size = if account.data.is_empty() {
             0
         } else {
-            // For base64, we can calculate the size
-            // or we can decode to get exact size
+            /* For base64, we can calculate the size
+               or we can decode to get exact size */
             use base64::{Engine as _, engine::general_purpose};
             match general_purpose::STANDARD.decode(&account.data) {
                 Ok(decoded) => decoded.len() as u64,
                 Err(_) => {
-                    // If decode fails, assume empty data
+                    /* If decode fails, assume empty data */
                     0
                 }
             }
         };
-
-        // For Agave BHD, we don't have a specific offset in the file for data
-        // We store 0 as offset, but include the file path so data can be retrieved if needed
+        /* For Agave BHD, we don't have a specific offset in the file for data
+           We store 0 as offset, but include the file path so data can be retrieved if needed */
         Ok(crate::reader::structures::AccountUpdate {
             key,
             meta,
             data_size,
-            data_offset: 0, // Not applicable for JSON format
+            data_offset: 0, /* Not applicable for JSON format */
             slot,
-            txn_idx,
+            txn_idx: None, /* Agave BHD doesn't provide transaction indices */
             file: Some(source_file.to_string_lossy().to_string()),
         })
     }
@@ -307,25 +304,25 @@ impl AgaveBhdReader {
 pub fn read_account_data_from_bhd(
     account_update: &crate::reader::structures::AccountUpdate,
 ) -> Result<Vec<u8>, AgaveBhdReaderError> {
-    // Get the file path from the account update
+    /* Get the file path from the account update */
     let file_path = account_update.file.as_ref().ok_or_else(|| {
         AgaveBhdReaderError::InvalidFormat(
             "AccountUpdate does not have a file path set".to_string()
         )
     })?;
     
-    // Read and parse the JSON file
+    /* Read and parse the JSON file */
     let contents = fs::read_to_string(file_path)?;
     let bhd: AgaveBankHashDetails = serde_json::from_str(&contents)?;
     
-    // Find the account in the file
+    /* Find the account in the file */
     let target_key = bs58::encode(&account_update.key.key).into_string();
     
     for entry in bhd.bank_hash_details {
         if entry.slot == account_update.slot {
             for account in &entry.accounts {
                 if account.pubkey == target_key {
-                    // Decode the base64 data
+                    /* Decode the base64 data */
                     use base64::{Engine as _, engine::general_purpose};
                     return general_purpose::STANDARD
                         .decode(&account.data)
@@ -361,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_parse_pubkey() {
-        // Test with a valid base58 pubkey (all 1s)
+        /* Test with a valid base58 pubkey (all 1s) */
         let pubkey_str = "11111111111111111111111111111111";
         let result = AgaveBhdReader::parse_pubkey(pubkey_str);
         assert!(result.is_ok());
@@ -369,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_parse_hash() {
-        // Test with a valid base58 hash
+        /* Test with a valid base58 hash */
         let hash_str = "HtVSNPupEb7voSXYhHG3xXasfjgYQGBuSYtKVWEN9HZ1";
         let result = AgaveBhdReader::parse_hash(hash_str);
         assert!(result.is_ok());

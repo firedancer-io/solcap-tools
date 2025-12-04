@@ -1,101 +1,151 @@
-use crate::reader::{AgaveBhdReaderError, SolcapData, SolcapReaderError};
+use crate::reader::{AgaveBhdReaderError, SolcapData, SolcapReaderError, read_account_data};
+use crate::reader::structures::AccountUpdate;
 use crate::utils::spinner::Spinner;
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::fs;
+use base64::{Engine as _, engine::general_purpose};
 
-/// Errors that can occur during diffing
 #[derive(Debug)]
 pub enum DiffError {
-    /// Error reading solcap file
     SolcapError(SolcapReaderError),
-    /// Error reading Agave bank hash details
     AgaveError(AgaveBhdReaderError),
-    /// IO error
     IoError(std::io::Error),
-    /// Path doesn't exist
     PathNotFound(String),
 }
 
 impl From<SolcapReaderError> for DiffError {
-    fn from(err: SolcapReaderError) -> Self {
-        DiffError::SolcapError(err)
-    }
+    fn from(err: SolcapReaderError) -> Self { DiffError::SolcapError(err) }
 }
 
 impl From<AgaveBhdReaderError> for DiffError {
-    fn from(err: AgaveBhdReaderError) -> Self {
-        DiffError::AgaveError(err)
-    }
+    fn from(err: AgaveBhdReaderError) -> Self { DiffError::AgaveError(err) }
 }
 
 impl From<std::io::Error> for DiffError {
-    fn from(err: std::io::Error) -> Self {
-        DiffError::IoError(err)
-    }
+    fn from(err: std::io::Error) -> Self { DiffError::IoError(err) }
 }
 
-/// Parse a path (either a file or directory) into SolcapData with spinner
-fn parse_path<P: AsRef<Path>>(path: P, source: &str) -> Result<SolcapData, DiffError> {
-    let path = path.as_ref();
+/* Helper to print a diff line */
+fn print_diff<T: std::fmt::Display>(label: &str, v1: T, v2: T) {
+    println!("  {}:", label);
+    println!("    \x1b[31m- 1: {}\x1b[0m", v1);
+    println!("    \x1b[32m+ 2: {}\x1b[0m", v2);
+}
 
+/* Format bytes as hex */
+fn hex(data: &[u8]) -> String {
+    if data.is_empty() { return "(empty)".to_string(); }
+    data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+}
+
+/* Format pubkey/hash as base58 */
+fn b58(key: &[u8; 32]) -> String { bs58::encode(key).into_string() }
+
+/* Parse path into SolcapData */
+fn parse_path<P: AsRef<Path>>(path: P, name: &str) -> Result<SolcapData, DiffError> {
+    let path = path.as_ref();
     if !path.exists() {
-        return Err(DiffError::PathNotFound(format!(
-            "Path does not exist: {}",
-            path.display()
-        )));
+        return Err(DiffError::PathNotFound(format!("Path does not exist: {}", path.display())));
     }
 
-    // Start spinner with source and path (bold "Ingesting Source X:")
-    let spinner = Spinner::new(&format!("\x1b[1mIngesting {}\x1b[0m \x1b[2m{}\x1b[0m", source, path.display()));
-
+    let spinner = Spinner::new(&format!("\x1b[1mIngesting {}\x1b[0m \x1b[2m{}\x1b[0m", name, path.display()));
+    
     let data = if path.is_dir() {
-        // Parse as Agave bank hash details directory (without its own spinner)
-        parse_agave_bhd_directory_no_spinner(path)?
+        use crate::reader::agave_bhd_reader::AgaveBhdReader;
+        AgaveBhdReader::from_directory(path)?.parse_directory()?
     } else {
-        // Parse as solcap file (without its own spinner)
-        parse_solcap_file_no_spinner(path)?
+        use crate::reader::solcap_reader::SolcapReader;
+        SolcapReader::from_file(path)?.parse_file()?
     };
 
-    // Finish spinner with stats on next line
-    let stats = format!(
-        "    Slots: {} - {} \x1b[2m({} slots, {} final account updates)\x1b[0m",
-        data.lowest_slot,
-        data.highest_slot,
-        data.slot_count(),
-        data.total_account_updates_final()
-    );
-    spinner.finish_with_lines(vec![&stats]);
-
+    spinner.finish_with_lines(vec![&format!(
+        "    Slots: {} - {} \x1b[2m({} slots, {} accounts)\x1b[0m",
+        data.lowest_slot, data.highest_slot, data.slot_count(), data.total_account_updates_final()
+    )]);
     Ok(data)
 }
 
-/// Parse solcap file without spinner (used by parse_path which has its own spinner)
-fn parse_solcap_file_no_spinner<P: AsRef<Path>>(path: P) -> Result<SolcapData, DiffError> {
-    use crate::reader::solcap_reader::SolcapReader;
-    let mut reader = SolcapReader::from_file(path)?;
-    Ok(reader.parse_file()?)
+/* Load all account data for a slot - OPTIMIZED for bank_hash_details 
+   Groups accounts by source file and loads each file only once */
+fn load_slot_data(
+    keys: &HashSet<[u8; 32]>, 
+    updates: &HashMap<[u8; 32], AccountUpdate>, 
+    path: &PathBuf
+) -> HashMap<[u8; 32], Vec<u8>> {
+    let mut cache = HashMap::new();
+    
+    /* Group accounts by source file */
+    let mut by_file: HashMap<Option<String>, Vec<[u8; 32]>> = HashMap::new();
+    for key in keys {
+        if let Some(acc) = updates.get(key) {
+            by_file.entry(acc.file.clone()).or_default().push(*key);
+        }
+    }
+    
+    for (file_opt, account_keys) in by_file {
+        if let Some(file_path) = file_opt {
+            /* Bank hash details - load ALL accounts from this JSON file at once */
+            if let Ok(file_data) = load_bhd_file_data(&file_path, &account_keys, updates) {
+                cache.extend(file_data);
+            }
+        } else {
+            /* Solcap file - read each account (efficient with offset seeks) */
+            for key in account_keys {
+                if let Some(acc) = updates.get(&key) {
+                    if let Ok(data) = read_account_data(path, acc) {
+                        cache.insert(key, data);
+                    }
+                }
+            }
+        }
+    }
+    
+    cache
 }
 
-/// Parse Agave BHD directory without spinner (used by parse_path which has its own spinner)
-fn parse_agave_bhd_directory_no_spinner<P: AsRef<Path>>(
-    path: P,
-) -> Result<SolcapData, DiffError> {
-    use crate::reader::agave_bhd_reader::AgaveBhdReader;
-    let reader = AgaveBhdReader::from_directory(path)?;
-    Ok(reader.parse_directory()?)
+/* Load multiple accounts from a single bank_hash_details JSON file (batch operation) */
+fn load_bhd_file_data(
+    file_path: &str,
+    keys: &[[u8; 32]],
+    updates: &HashMap<[u8; 32], AccountUpdate>,
+) -> Result<HashMap<[u8; 32], Vec<u8>>, std::io::Error> {
+    /* Read and parse JSON file ONCE */
+    let contents = fs::read_to_string(file_path)?;
+    let bhd: crate::reader::agave_bhd_reader::AgaveBankHashDetails = 
+        serde_json::from_str(&contents).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    
+    /* Build set of target keys for fast lookup */
+    let target_keys: HashSet<String> = keys.iter().map(|k| b58(k)).collect();
+    
+    /* Find target slot from first account */
+    let target_slot = keys.first().and_then(|k| updates.get(k)).map(|acc| acc.slot);
+    
+    let mut result = HashMap::new();
+    
+    /* Extract matching accounts in single pass */
+    for entry in bhd.bank_hash_details {
+        if Some(entry.slot) == target_slot {
+            for account in &entry.accounts {
+                if target_keys.contains(&account.pubkey) {
+                    if let Ok(data) = general_purpose::STANDARD.decode(&account.data) {
+                        if let Ok(key_bytes) = bs58::decode(&account.pubkey).into_vec() {
+                            if key_bytes.len() == 32 {
+                                let mut key = [0u8; 32];
+                                key.copy_from_slice(&key_bytes);
+                                result.insert(key, data);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(result)
 }
 
-/// Format a pubkey as base58 string
-fn format_pubkey(key: &[u8; 32]) -> String {
-    bs58::encode(key).into_string()
-}
-
-/// Format a hash as base58 string
-fn format_hash(hash: &[u8; 32]) -> String {
-    bs58::encode(hash).into_string()
-}
-
-/// Diff two SolcapData structures
+/* Main diff function */
 pub fn diff_solcap<P1: AsRef<Path>, P2: AsRef<Path>>(
     path1: P1,
     path2: P2,
@@ -103,287 +153,163 @@ pub fn diff_solcap<P1: AsRef<Path>, P2: AsRef<Path>>(
     start_slot: Option<u32>,
     end_slot: Option<u32>,
 ) -> Result<(), DiffError> {
-    // Parse both paths (spinner will show progress and stats)
-    println!("\n         \x1b[1;33mSolcap Diff\x1b[0m");
-    println!("─────────────────────────────\n");
+    println!("\n         \x1b[1;33mSolcap Diff\x1b[0m\n─────────────────────────────\n");
 
     let data1 = parse_path(&path1, "Source 1")?;
     let data2 = parse_path(&path2, "Source 2")?;
+    let path1 = path1.as_ref().to_path_buf();
+    let path2 = path2.as_ref().to_path_buf();
 
-    // Find common slots
+    /* Find common slots */
     let slots1: HashSet<u32> = data1.slot_account_updates_final.keys().copied().collect();
     let slots2: HashSet<u32> = data2.slot_account_updates_final.keys().copied().collect();
-
-    let common_slots: Vec<u32> = slots1
-        .intersection(&slots2)
+    let mut common: Vec<u32> = slots1.intersection(&slots2)
         .copied()
-        .filter(|&slot| {
-            let after_start = start_slot.map_or(true, |s| slot >= s);
-            let before_end = end_slot.map_or(true, |e| slot <= e);
-            after_start && before_end
-        })
+        .filter(|s| start_slot.map_or(true, |st| *s >= st) && end_slot.map_or(true, |en| *s <= en))
         .collect();
+    common.sort_unstable();
 
-    let mut common_slots = common_slots;
-    common_slots.sort_unstable();
-
-    if common_slots.is_empty() {
-        println!("\nNo common slots found to compare.");
+    if common.is_empty() {
+        println!("\nNo common slots found.");
         return Ok(());
     }
 
-    println!("\nComparing {} common slots", common_slots.len());
+    println!("\nComparing {} common slots\n{}", common.len(), "=".repeat(80));
 
-    println!("\n{}", "=".repeat(80));
+    let mut diff_slots = 0;
+    let mut diff_accounts = 0;
 
-    // Diff each common slot
-    let mut total_differing_slots = 0;
-    let mut total_differing_accounts = 0;
-
-    for slot in common_slots {
-        let (has_diff, diff_accounts) = diff_slot(slot, &data1, &data2, verbosity)?;
-        if has_diff {
-            total_differing_slots += 1;
+    for slot in common {
+        let (has_diff, n_accounts) = diff_slot(slot, &data1, &data2, verbosity, &path1, &path2);
+        if has_diff { 
+            diff_slots += 1; 
+        } else {
+            println!("\nSlot {} - \x1b[32mMATCH\x1b[0m", slot);
         }
-        total_differing_accounts += diff_accounts;
+        diff_accounts += n_accounts;
     }
 
-    println!("\n{}", "=".repeat(80));
-    println!("Summary:");
-    println!("  Total differing slots: {}", total_differing_slots);
-    println!("  Total differing accounts: {}", total_differing_accounts);
-
+    println!("\n{}\nSummary:\n  Differing slots: {}\n  Differing accounts: {}", "=".repeat(80), diff_slots, diff_accounts);
     Ok(())
 }
 
-/// Diff a single slot between two SolcapData structures
-/// Returns (has_differences, count_of_differing_accounts)
-fn diff_slot(slot: u32, data1: &SolcapData, data2: &SolcapData, verbosity: u8) -> Result<(bool, usize), DiffError> {
-    let updates1 = data1.get_account_updates_final(slot);
-    let updates2 = data2.get_account_updates_final(slot);
-
-    if updates1.is_none() || updates2.is_none() {
-        return Ok((false, 0));
-    }
-
-    let updates1 = updates1.unwrap();
-    let updates2 = updates2.unwrap();
-
-    // Compare bank preimages if verbosity >= 1
+/* Diff a single slot */
+fn diff_slot(slot: u32, d1: &SolcapData, d2: &SolcapData, v: u8, p1: &PathBuf, p2: &PathBuf) -> (bool, usize) {
     let mut has_diff = false;
-    let mut differing_accounts = 0;
+    let diff_accounts;
 
-    if verbosity >= 1 {
-        let preimage1 = data1.get_bank_preimage(slot);
-        let preimage2 = data2.get_bank_preimage(slot);
-
-        match (preimage1, preimage2) {
-            (Some(p1), Some(p2)) => {
-                // Compare bank hashes
-                if p1.bank_hash.hash != p2.bank_hash.hash {
-                    if !has_diff {
-                        println!("\nSlot {} - MISMATCH", slot);
-                        has_diff = true;
-                    }
-                    println!("  Bank Hash:");
-                    println!("    \x1b[31m- 1: {}\x1b[0m", format_hash(&p1.bank_hash.hash));
-                    println!("    \x1b[32m+ 2: {}\x1b[0m", format_hash(&p2.bank_hash.hash));
+    /* v1+: Bank preimage */
+    if v >= 1 {
+        if let (Some(pre1), Some(pre2)) = (d1.get_bank_preimage(slot), d2.get_bank_preimage(slot)) {
+            if pre1.bank_hash.hash != pre2.bank_hash.hash {
+                if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                print_diff("Bank Hash", b58(&pre1.bank_hash.hash), b58(&pre2.bank_hash.hash));
+            }
+            
+            /* v2+: Full preimage */
+            if v >= 2 {
+                if pre1.prev_bank_hash.hash != pre2.prev_bank_hash.hash {
+                    if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                    print_diff("Prev Bank Hash", b58(&pre1.prev_bank_hash.hash), b58(&pre2.prev_bank_hash.hash));
                 }
-
-                if verbosity >= 2 {
-                    // Compare full preimage
-                    if p1.prev_bank_hash.hash != p2.prev_bank_hash.hash {
-                        if !has_diff {
-                            println!("\nSlot {} - MISMATCH", slot);
-                            has_diff = true;
-                        }
-                        println!("  Previous Bank Hash:");
-                        println!("    \x1b[31m- 1: {}\x1b[0m", format_hash(&p1.prev_bank_hash.hash));
-                        println!("    \x1b[32m+ 2: {}\x1b[0m", format_hash(&p2.prev_bank_hash.hash));
-                    }
-
-                    if p1.accounts_lt_hash_checksum.hash != p2.accounts_lt_hash_checksum.hash {
-                        if !has_diff {
-                            println!("\nSlot {} - MISMATCH", slot);
-                            has_diff = true;
-                        }
-                        println!("  Accounts LT Hash Checksum:");
-                        println!("    \x1b[31m- 1: {}\x1b[0m", format_hash(&p1.accounts_lt_hash_checksum.hash));
-                        println!("    \x1b[32m+ 2: {}\x1b[0m", format_hash(&p2.accounts_lt_hash_checksum.hash));
-                    }
-
-                    if p1.poh_hash.hash != p2.poh_hash.hash {
-                        if !has_diff {
-                            println!("\nSlot {} - MISMATCH", slot);
-                            has_diff = true;
-                        }
-                        println!("  PoH Hash:");
-                        println!("    \x1b[31m- 1: {}\x1b[0m", format_hash(&p1.poh_hash.hash));
-                        println!("    \x1b[32m+ 2: {}\x1b[0m", format_hash(&p2.poh_hash.hash));
-                    }
-
-                    // Copy packed fields to local variables
-                    let sig_cnt1 = p1.signature_cnt;
-                    let sig_cnt2 = p2.signature_cnt;
-                    if sig_cnt1 != sig_cnt2 {
-                        if !has_diff {
-                            println!("\nSlot {} - MISMATCH", slot);
-                            has_diff = true;
-                        }
-                        println!("  Signature Count:");
-                        println!("    \x1b[31m- 1: {}\x1b[0m", sig_cnt1);
-                        println!("    \x1b[32m+ 2: {}\x1b[0m", sig_cnt2);
-                    }
+                if pre1.accounts_lt_hash_checksum.hash != pre2.accounts_lt_hash_checksum.hash {
+                    if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                    print_diff("Accounts LT Hash", b58(&pre1.accounts_lt_hash_checksum.hash), b58(&pre2.accounts_lt_hash_checksum.hash));
                 }
-            }
-            (None, Some(_)) => {
-                println!("\nSlot {} - WARNING: Bank preimage missing in source 1", slot);
-            }
-            (Some(_), None) => {
-                println!("\nSlot {} - WARNING: Bank preimage missing in source 2", slot);
-            }
-            (None, None) => {
-                // Both missing, skip
+                if pre1.poh_hash.hash != pre2.poh_hash.hash {
+                    if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                    print_diff("PoH Hash", b58(&pre1.poh_hash.hash), b58(&pre2.poh_hash.hash));
+                }
+                let (s1, s2) = (pre1.signature_cnt, pre2.signature_cnt);
+                if s1 != s2 {
+                    if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                    print_diff("Signature Count", s1, s2);
+                }
             }
         }
     }
 
-    // Compare accounts if verbosity >= 3
-    if verbosity >= 3 {
-        // Find accounts in both, only in 1, only in 2
-        let keys1: HashSet<[u8; 32]> = updates1.keys().copied().collect();
-        let keys2: HashSet<[u8; 32]> = updates2.keys().copied().collect();
+    /* v3+: Account comparison */
+    let mut n_diff_accounts = 0;
+    if v >= 3 {
+        let u1 = d1.get_account_updates_final(slot);
+        let u2 = d2.get_account_updates_final(slot);
+        
+        if let (Some(u1), Some(u2)) = (u1, u2) {
+            let k1: HashSet<[u8; 32]> = u1.keys().copied().collect();
+            let k2: HashSet<[u8; 32]> = u2.keys().copied().collect();
+            let common: HashSet<[u8; 32]> = k1.intersection(&k2).copied().collect();
+            let only1: Vec<_> = k1.difference(&k2).collect();
+            let only2: Vec<_> = k2.difference(&k1).collect();
 
-        let common_keys: HashSet<[u8; 32]> = keys1.intersection(&keys2).copied().collect();
-        let only_in_1: HashSet<[u8; 32]> = keys1.difference(&keys2).copied().collect();
-        let only_in_2: HashSet<[u8; 32]> = keys2.difference(&keys1).copied().collect();
-
-        if !only_in_1.is_empty() {
-            if !has_diff {
-                println!("\nSlot {} - MISMATCH", slot);
-                has_diff = true;
+            /* Accounts only in source 1 */
+            if !only1.is_empty() {
+                if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                println!("  Accounts only in Source 1: {}", only1.len());
+                for k in &only1 { println!("    \x1b[31m- {}\x1b[0m", b58(k)); }
             }
-            println!("  Source 1 ONLY Accounts: {}", only_in_1.len());
-            if verbosity >= 4 {
-                for key in only_in_1.iter().take(10) {
-                    println!("  \x1b[31m- {}\x1b[0m", format_pubkey(key));
-                }
-                if only_in_1.len() > 10 {
-                    println!("  ... and {} more", only_in_1.len() - 10);
-                }
+
+            /* Accounts only in source 2 */
+            if !only2.is_empty() {
+                if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                println!("  Accounts only in Source 2: {}", only2.len());
+                for k in &only2 { println!("    \x1b[32m+ {}\x1b[0m", b58(k)); }
             }
-            println!();
-        }
 
-        if !only_in_2.is_empty() {
-            if !has_diff {
-                println!("\nSlot {} - MISMATCH", slot);
-                has_diff = true;
-            }
-            println!("  Source 2 ONLY Accounts: {}", only_in_2.len());
-            if verbosity >= 4 {
-                for key in only_in_2.iter().take(10) {
-                    println!("  \x1b[32m+ {}\x1b[0m", format_pubkey(key));
-                }
-                if only_in_2.len() > 10 {
-                    println!("  ... and {} more", only_in_2.len() - 10);
-                }
-            }
-            println!();
-        }
+            /* v5: Pre-load data (optimized batch loading) */
+            let (cache1, cache2) = if v >= 5 {
+                (Some(load_slot_data(&common, u1, p1)), Some(load_slot_data(&common, u2, p2)))
+            } else {
+                (None, None)
+            };
 
-        // Compare common accounts
-        for key in &common_keys {
-            let acc1 = &updates1[key];
-            let acc2 = &updates2[key];
+            /* Compare common accounts */
+            for key in &common {
+                let (a1, a2) = (&u1[key], &u2[key]);
+                let mut acc_diff = false;
 
-            if !accounts_equal(acc1, acc2, verbosity) {
-                differing_accounts += 1;
+                /* v4+: Account metadata */
+                if v >= 4 {
+                    let (l1, l2) = (a1.meta.lamports, a2.meta.lamports);
+                    let (o1, o2) = (a1.meta.owner.key, a2.meta.owner.key);
+                    let (e1, e2) = (a1.meta.executable, a2.meta.executable);
+                    let (ds1, ds2) = (a1.data_size, a2.data_size);
 
-                if !has_diff {
-                    println!("\nSlot {} - MISMATCH", slot);
-                    has_diff = true;
+                    if l1 != l2 || o1 != o2 || e1 != e2 || ds1 != ds2 {
+                        if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                        if !acc_diff { println!("  Account {}:", b58(key)); acc_diff = true; }
+                        if l1 != l2 { print_diff("Lamports", l1, l2); }
+                        if o1 != o2 { print_diff("Owner", b58(&o1), b58(&o2)); }
+                        if e1 != e2 { print_diff("Executable", e1, e2); }
+                        if ds1 != ds2 { print_diff("Data Size", ds1, ds2); }
+                    }
                 }
 
-                if verbosity >= 4 {
-                    println!("  Account {}:", format_pubkey(key));
-                    print_account_diff(acc1, acc2);
-                }
-            }
-        }
+                /* v5: Account data */
+                if v >= 5 {
+                    let data1 = cache1.as_ref().and_then(|c| c.get(key));
+                    let data2 = cache2.as_ref().and_then(|c| c.get(key));
+                    
+                    let differs = match (data1, data2) {
+                        (Some(d1), Some(d2)) => d1 != d2,
+                        (None, None) => false,
+                        _ => true,
+                    };
 
-        if differing_accounts > 0 && verbosity < 4 {
-            if !has_diff {
-                println!("\nSlot {} - MISMATCH", slot);
-                has_diff = true;
+                    if differs {
+                        if !has_diff { println!("\nSlot {} - \x1b[31mMISMATCH\x1b[0m", slot); has_diff = true; }
+                        if !acc_diff { println!("  Account {}:", b58(key)); acc_diff = true; }
+                        println!("    Data:");
+                        println!("      \x1b[31m- 1: {}\x1b[0m", data1.map(|d| hex(d)).unwrap_or("N/A".into()));
+                        println!("      \x1b[32m+ 2: {}\x1b[0m", data2.map(|d| hex(d)).unwrap_or("N/A".into()));
+                    }
+                }
+
+                if acc_diff { n_diff_accounts += 1; }
             }
-            println!("  {} accounts have different values", differing_accounts);
         }
     }
+    diff_accounts = n_diff_accounts;
 
-    Ok((has_diff, differing_accounts))
+    (has_diff, diff_accounts)
 }
-
-/// Check if two accounts are equal based on metadata
-fn accounts_equal(
-    acc1: &crate::reader::structures::AccountUpdate,
-    acc2: &crate::reader::structures::AccountUpdate,
-    _verbosity: u8,
-) -> bool {
-    // Compare metadata
-    acc1.meta.lamports == acc2.meta.lamports
-        && acc1.meta.owner.key == acc2.meta.owner.key
-        && acc1.meta.executable == acc2.meta.executable
-        && acc1.data_size == acc2.data_size
-}
-
-/// Print differences between two accounts
-fn print_account_diff(
-    acc1: &crate::reader::structures::AccountUpdate,
-    acc2: &crate::reader::structures::AccountUpdate,
-) {
-    // Copy packed fields to local variables to avoid unaligned references
-    let lamports1 = acc1.meta.lamports;
-    let lamports2 = acc2.meta.lamports;
-    let owner1 = acc1.meta.owner.key;
-    let owner2 = acc2.meta.owner.key;
-    let executable1 = acc1.meta.executable;
-    let executable2 = acc2.meta.executable;
-    let data_size1 = acc1.data_size;
-    let data_size2 = acc2.data_size;
-
-    if lamports1 != lamports2 {
-        println!("    Lamports:");
-        println!("      \x1b[31m- 1: {}\x1b[0m", lamports1);
-        println!("      \x1b[32m+ 2: {}\x1b[0m", lamports2);
-    }
-    if owner1 != owner2 {
-        println!("    Owner:");
-        println!("      \x1b[31m- 1: {}\x1b[0m", format_pubkey(&owner1));
-        println!("      \x1b[32m+ 2: {}\x1b[0m", format_pubkey(&owner2));
-    }
-    if executable1 != executable2 {
-        println!("    Executable:");
-        println!("      \x1b[31m- 1: {}\x1b[0m", executable1);
-        println!("      \x1b[32m+ 2: {}\x1b[0m", executable2);
-    }
-    if data_size1 != data_size2 {
-        println!("    Data Size:");
-        println!("      \x1b[31m- 1: {}\x1b[0m", data_size1);
-        println!("      \x1b[32m+ 2: {}\x1b[0m", data_size2);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_pubkey() {
-        let key = [0u8; 32];
-        let formatted = format_pubkey(&key);
-        // System program pubkey (all zeros)
-        assert_eq!(formatted, "11111111111111111111111111111111");
-    }
-}
-

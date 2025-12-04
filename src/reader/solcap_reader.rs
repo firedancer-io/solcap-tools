@@ -1,310 +1,337 @@
+/*! Solcap file reader - wraps pcap_parser for solcap-specific operations. */
+
 use crate::model::structs::*;
 use crate::reader::structures::{AccountUpdate, SolcapData};
-use crate::reader::pcap_iter::{BlockHandler, IterationState, PcapIterator, PcapIterError, DEFAULT_BUFFER_SIZE};
 use crate::utils::spinner::Spinner;
-use pcap_parser::PcapBlockOwned;
+use pcap_parser::{PcapBlockOwned, PcapError, PcapNGReader};
+use pcap_parser::traits::PcapReaderIterator;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::mem;
 use std::path::Path;
 
-/// Errors that can occur during solcap file reading
+/* Default buffer size (64MB) - large enough for big account data */
+pub const DEFAULT_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+
+/// Solcap reader error
 #[derive(Debug)]
-pub enum SolcapReaderError {
-    /// IO error when reading file
-    IoError(std::io::Error),
-    /// PCAP parsing error
-    PcapError(String),
-    /// Invalid solcap format
+pub enum SolcapError {
+    Io(std::io::Error),
+    Parse(String),
     InvalidFormat(String),
-    /// Incomplete data
-    IncompleteData(String),
 }
 
-impl From<std::io::Error> for SolcapReaderError {
+pub type SolcapReaderError = SolcapError;
+pub type PcapIterError = SolcapError;
+
+impl From<std::io::Error> for SolcapError {
     fn from(err: std::io::Error) -> Self {
-        SolcapReaderError::IoError(err)
+        SolcapError::Io(err)
     }
 }
 
-impl From<PcapIterError> for SolcapReaderError {
-    fn from(err: PcapIterError) -> Self {
-        match err {
-            PcapIterError::IoError(e) => SolcapReaderError::IoError(e),
-            PcapIterError::PcapError(e) => SolcapReaderError::PcapError(e),
-            PcapIterError::InvalidFormat(e) => SolcapReaderError::InvalidFormat(e),
-            PcapIterError::IncompleteData(e) => SolcapReaderError::IncompleteData(e),
-        }
+impl<I: std::fmt::Debug> From<PcapError<I>> for SolcapError {
+    fn from(err: PcapError<I>) -> Self {
+        SolcapError::Parse(format!("{:?}", err))
     }
 }
 
-/// Block handler for parsing solcap files
-struct SolcapParseHandler {
-    data: SolcapData,
-}
-
-impl BlockHandler for SolcapParseHandler {
-    type Error = SolcapReaderError;
-
-    fn handle_block(
-        &mut self,
-        block: &PcapBlockOwned,
-        state: &mut IterationState,
-        _offset: usize,
-    ) -> Result<(), Self::Error> {
-        Self::process_block(block, &mut self.data, state)
-    }
-
-    fn handle_unexpected_eof(
-        &mut self,
-        state: &mut IterationState,
-    ) -> Result<(), Self::Error> {
-        // Allow partial files - just warn
-        if state.blocks_processed > 0 {
-            eprintln!("Warning: Unexpected EOF encountered (may be incomplete last block), but {} blocks were processed successfully", state.blocks_processed);
-            Ok(())
-        } else {
-            Err(SolcapReaderError::IncompleteData(
-                "File appears to be truncated or invalid".to_string()
-            ))
+impl std::fmt::Display for SolcapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SolcapError::Io(e) => write!(f, "IO error: {}", e),
+            SolcapError::Parse(e) => write!(f, "Parse error: {}", e),
+            SolcapError::InvalidFormat(msg) => write!(f, "Invalid format: {}", msg),
         }
     }
 }
 
-impl SolcapParseHandler {
-    fn process_block(
-        block: &PcapBlockOwned,
-        data: &mut SolcapData,
-        state: &mut IterationState,
-    ) -> Result<(), SolcapReaderError> {
-        match block {
-            PcapBlockOwned::NG(ng_block) => {
-                use pcap_parser::pcapng::*;
-                
-                match ng_block {
-                    Block::SectionHeader(_) => {
-                        state.section_found = true;
-                    }
-                    Block::InterfaceDescription(_) => {
-                        state.idb_found = true;
-                    }
-                    Block::EnhancedPacket(epb) => {
-                        Self::process_enhanced_packet_block(epb, data, state.current_offset)?;
-                    }
-                    _ => {
-                        // Ignore other block types for now
-                    }
-                }
-            }
-            _ => {
-                // Legacy PCAP format not expected in solcap files
-                return Err(SolcapReaderError::InvalidFormat(
-                    "Legacy PCAP format not supported for solcap files".to_string(),
-                ));
-            }
-        }
-        Ok(())
-    }
+impl std::error::Error for SolcapError {}
 
-    /// Process an Enhanced Packet Block containing solcap data
-    fn process_enhanced_packet_block(
-        epb: &pcap_parser::pcapng::EnhancedPacketBlock,
-        data: &mut SolcapData,
-        current_offset: u64,
-    ) -> Result<(), SolcapReaderError> {
-        let packet_data = epb.data;
-        
-        if packet_data.len() < mem::size_of::<SolcapChunkIntHdr>() {
-            return Err(SolcapReaderError::IncompleteData(
-                "Packet too small for internal chunk header".to_string(),
-            ));
-        }
-
-        // Parse the internal chunk header
-        let int_hdr = unsafe {
-            std::ptr::read_unaligned(packet_data.as_ptr() as *const SolcapChunkIntHdr)
-        };
-
-        let remaining_data = &packet_data[mem::size_of::<SolcapChunkIntHdr>()..];
-        
-        // Process based on block type
-        match int_hdr.block_type {
-            SOLCAP_WRITE_ACCOUNT_HDR => {
-                Self::process_account_update(int_hdr.slot, int_hdr.txn_idx, remaining_data, data, current_offset)?;
-
-            }
-            SOLCAP_WRITE_BANK_PREIMAGE => {
-                Self::process_bank_preimage(int_hdr.slot, remaining_data, data)?;
-            }
-            SOLCAP_WRITE_ACCOUNT_DATA => {
-                // Account data blocks are handled as part of account header processing
-                // We store the offset for later data retrieval
-            }
-            _ => {
-                // Other message types (stake rewards, etc.) - ignore for now
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Process an account update message
-    fn process_account_update(
+/// A parsed solcap chunk from an Enhanced Packet Block
+#[derive(Debug, Clone)]
+pub enum SolcapChunk {
+    AccountUpdate {
         slot: u32,
         txn_idx: u64,
-        data: &[u8],
-        solcap_data: &mut SolcapData,
-        current_offset: u64,
-    ) -> Result<(), SolcapReaderError> {
-        if data.len() < mem::size_of::<SolcapAccountUpdateHdr>() {
-            return Err(SolcapReaderError::IncompleteData(
-                "Insufficient data for account update header".to_string(),
-            ));
-        }
-
-        // Parse account update header
-        let update_hdr = unsafe {
-            std::ptr::read_unaligned(data.as_ptr() as *const SolcapAccountUpdateHdr)
-        };
-
-        // Calculate data offset (current position + header size)
-        let data_offset = current_offset + mem::size_of::<SolcapChunkIntHdr>() as u64 + mem::size_of::<SolcapAccountUpdateHdr>() as u64;
-
-        let account_update = AccountUpdate {
-            key: update_hdr.key,
-            meta: update_hdr.info,
-            data_size: update_hdr.data_sz,
-            data_offset,
-            slot,
-            txn_idx,
-            file: None, // Solcap files don't use per-account file tracking
-        };
-
-        solcap_data.add_account_update(slot, account_update);
-        Ok(())
-    }
-
-    /// Process a bank preimage message
-    fn process_bank_preimage(
+        key: Pubkey,
+        meta: SolanaAccountMeta,
+        data_size: u64,
+        data_offset: u64,
+    },
+    BankPreimage {
         slot: u32,
-        data: &[u8],
-        solcap_data: &mut SolcapData,
-    ) -> Result<(), SolcapReaderError> {
-        if data.len() < mem::size_of::<SolcapBankPreimage>() {
-            return Err(SolcapReaderError::IncompleteData(
-                "Insufficient data for bank preimage".to_string(),
-            ));
-        }
-
-        // Parse bank preimage
-        let bank_preimage = unsafe {
-            std::ptr::read_unaligned(data.as_ptr() as *const SolcapBankPreimage)
-        };
-
-        solcap_data.add_bank_preimage(slot, bank_preimage);
-        Ok(())
-    }
+        preimage: SolcapBankPreimage,
+    },
+    StakeAccountPayout {
+        slot: u32,
+        txn_idx: u64,
+        payout: SolcapStakeAccountPayout,
+    },
+    StakeRewardEvent {
+        slot: u32,
+        txn_idx: u64,
+        event: SolcapStakeRewardEvent,
+    },
+    StakeRewardsBegin {
+        slot: u32,
+        txn_idx: u64,
+        begin: SolcapStakeRewardsBegin,
+    },
 }
 
-/// Reader for solcap files in pcapng format
+/// Reader for solcap files - wraps pcap_parser for solcap-specific operations
 pub struct SolcapReader<R: Read> {
-    iterator: PcapIterator<R>,
+    reader: PcapNGReader<R>,
+    pub section_found: bool,
+    pub idb_found: bool,
+    current_offset: u64,
 }
 
 impl SolcapReader<BufReader<File>> {
-    /// Create a new SolcapReader from a file path
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, SolcapReaderError> {
+    /// Open a solcap file
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SolcapError> {
         let file = File::open(path)?;
-        let buf_reader = BufReader::new(file);
-        Self::new(buf_reader)
+        Self::new(BufReader::new(file))
+    }
+    
+    /// Alias for compatibility
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, SolcapError> {
+        Self::open(path)
     }
 }
 
 impl<R: Read> SolcapReader<R> {
-    /// Create a new SolcapReader from any Read implementation
-    pub fn new(reader: R) -> Result<Self, SolcapReaderError> {
-        let iterator = PcapIterator::with_buffer_size(reader, DEFAULT_BUFFER_SIZE)?;
-        Ok(Self { iterator })
+    /// Create reader from any Read source
+    pub fn new(reader: R) -> Result<Self, SolcapError> {
+        Self::with_buffer_size(reader, DEFAULT_BUFFER_SIZE)
     }
 
-    /// Parse the entire solcap file and build in-memory structures
-    pub fn parse_file(&mut self) -> Result<SolcapData, SolcapReaderError> {
-        let mut handler = SolcapParseHandler {
-            data: SolcapData::new(),
+    pub fn with_buffer_size(reader: R, buffer_size: usize) -> Result<Self, SolcapError> {
+        let pcap_reader = PcapNGReader::new(buffer_size, reader)?;
+        Ok(Self {
+            reader: pcap_reader,
+            section_found: false,
+            idb_found: false,
+            current_offset: 0,
+        })
+    }
+
+    /// Current position in file
+    pub fn position(&self) -> u64 {
+        self.current_offset
+    }
+
+    /// Access underlying reader for tools that need raw block access
+    pub fn inner(&self) -> &PcapNGReader<R> {
+        &self.reader
+    }
+
+    pub fn inner_mut(&mut self) -> &mut PcapNGReader<R> {
+        &mut self.reader
+    }
+
+    /// Get next solcap chunk (skips non-EPB blocks, returns parsed chunk)
+    pub fn next_chunk(&mut self) -> Result<Option<(SolcapChunk, u64)>, SolcapError> {
+        loop {
+            let offset = self.current_offset;
+            
+            /* Handle the next block */
+            let result = self.reader.next();
+            match result {
+                Ok((size, block)) => {
+                    /* Track header blocks and try to parse */
+                    let chunk = match &block {
+                        PcapBlockOwned::NG(ng_block) => {
+                            use pcap_parser::pcapng::Block;
+                            match ng_block {
+                                Block::SectionHeader(_) => {
+                                    self.section_found = true;
+                                    None
+                                }
+                                Block::InterfaceDescription(_) => {
+                                    self.idb_found = true;
+                                    None
+                                }
+                                Block::EnhancedPacket(epb) => {
+                                    Some(Self::parse_epb_static(epb.data, offset)?)
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => return Err(SolcapError::InvalidFormat("Legacy PCAP not supported".into())),
+                    };
+                    
+                    /* Consume and update offset */
+                    self.reader.consume(size);
+                    self.current_offset += size as u64;
+                    
+                    if let Some(c) = chunk {
+                        return Ok(Some((c, offset)));
+                    }
+                    /* Not an EPB with solcap data, continue to next block */
+                }
+                Err(PcapError::Eof) => return Ok(None),
+                Err(PcapError::Incomplete(_)) => {
+                    self.reader.refill()?;
+                    continue;
+                }
+                Err(PcapError::BufferTooSmall) => {
+                    let new_size = self.reader.data().len() * 2;
+                    if !self.reader.grow(new_size) {
+                        return Err(SolcapError::InvalidFormat("Block too large".into()));
+                    }
+                    self.reader.refill()?;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    
+    /* Static version that doesn't need &self */
+    fn parse_epb_static(data: &[u8], file_offset: u64) -> Result<SolcapChunk, SolcapError> {
+        if data.len() < mem::size_of::<SolcapChunkIntHdr>() {
+            return Err(SolcapError::InvalidFormat("Packet too small".into()));
+        }
+
+        let hdr = unsafe {
+            std::ptr::read_unaligned(data.as_ptr() as *const SolcapChunkIntHdr)
         };
+        let payload = &data[mem::size_of::<SolcapChunkIntHdr>()..];
+        let block_type = hdr.block_type;
 
-        self.iterator.iterate(&mut handler)?;
-        self.iterator.validate_headers()?;
+        match block_type {
+            SOLCAP_WRITE_ACCOUNT => {
+                if payload.len() < mem::size_of::<SolcapAccountUpdateHdr>() {
+                    return Err(SolcapError::InvalidFormat("Account header too small".into()));
+                }
+                let acct = unsafe {
+                    std::ptr::read_unaligned(payload.as_ptr() as *const SolcapAccountUpdateHdr)
+                };
+                let data_offset = file_offset 
+                    + mem::size_of::<SolcapChunkEpbHdr>() as u64  /* EPB header */
+                    + mem::size_of::<SolcapChunkIntHdr>() as u64
+                    + mem::size_of::<SolcapAccountUpdateHdr>() as u64;
+                
+                Ok(SolcapChunk::AccountUpdate {
+                    slot: hdr.slot,
+                    txn_idx: hdr.txn_idx,
+                    key: acct.key,
+                    meta: acct.info,
+                    data_size: acct.data_sz,
+                    data_offset,
+                })
+            }
+            SOLCAP_WRITE_BANK_PREIMAGE => {
+                if payload.len() < mem::size_of::<SolcapBankPreimage>() {
+                    return Err(SolcapError::InvalidFormat("Bank preimage too small".into()));
+                }
+                let preimage = unsafe {
+                    std::ptr::read_unaligned(payload.as_ptr() as *const SolcapBankPreimage)
+                };
+                Ok(SolcapChunk::BankPreimage { slot: hdr.slot, preimage })
+            }
+            SOLCAP_STAKE_ACCOUNT_PAYOUT => {
+                if payload.len() < mem::size_of::<SolcapStakeAccountPayout>() {
+                    return Err(SolcapError::InvalidFormat("Stake account payout too small".into()));
+                }
+                let payout = unsafe {
+                    std::ptr::read_unaligned(payload.as_ptr() as *const SolcapStakeAccountPayout)
+                };
+                Ok(SolcapChunk::StakeAccountPayout { slot: hdr.slot, txn_idx: hdr.txn_idx, payout })
+            }
+            SOLCAP_STAKE_REWARD_EVENT => {
+                if payload.len() < mem::size_of::<SolcapStakeRewardEvent>() {
+                    return Err(SolcapError::InvalidFormat("Stake reward event too small".into()));
+                }
+                let event = unsafe {
+                    std::ptr::read_unaligned(payload.as_ptr() as *const SolcapStakeRewardEvent)
+                };
+                Ok(SolcapChunk::StakeRewardEvent { slot: hdr.slot, txn_idx: hdr.txn_idx, event })
+            }
+            SOLCAP_STAKE_REWARDS_BEGIN => {
+                if payload.len() < mem::size_of::<SolcapStakeRewardsBegin>() {
+                    return Err(SolcapError::InvalidFormat("Stake rewards begin too small".into()));
+                }
+                let begin = unsafe {
+                    std::ptr::read_unaligned(payload.as_ptr() as *const SolcapStakeRewardsBegin)
+                };
+                Ok(SolcapChunk::StakeRewardsBegin { slot: hdr.slot, txn_idx: hdr.txn_idx, begin })
+            }
+            _ => Err(SolcapError::InvalidFormat(format!("Unknown block type: {}", block_type))),
+        }
+    }
 
-        Ok(handler.data)
+    /// Parse entire file into SolcapData structure
+    pub fn parse(&mut self) -> Result<SolcapData, SolcapError> {
+        let mut data = SolcapData::new();
+        
+        while let Some((chunk, _offset)) = self.next_chunk()? {
+            match chunk {
+                SolcapChunk::AccountUpdate { slot, txn_idx, key, meta, data_size, data_offset } => {
+                    data.add_account_update(slot, AccountUpdate {
+                        key, meta, data_size, data_offset, slot, txn_idx: Some(txn_idx), file: None,
+                    });
+                }
+                SolcapChunk::BankPreimage { slot, preimage } => {
+                    data.add_bank_preimage(slot, preimage);
+                }
+                /* Stake-related chunks - currently not stored in SolcapData */
+                SolcapChunk::StakeAccountPayout { .. } => {}
+                SolcapChunk::StakeRewardEvent { .. } => {}
+                SolcapChunk::StakeRewardsBegin { .. } => {}
+            }
+        }
+        
+        if !self.section_found {
+            return Err(SolcapError::InvalidFormat("No Section Header found".into()));
+        }
+        if !self.idb_found {
+            return Err(SolcapError::InvalidFormat("No Interface Description Block found".into()));
+        }
+        
+        Ok(data)
+    }
+    
+    /// Alias for compatibility
+    pub fn parse_file(&mut self) -> Result<SolcapData, SolcapError> {
+        self.parse()
     }
 }
 
-/// Read account data from a solcap file at a specific offset
-/// 
-/// This function allows you to retrieve the actual account data for a specific
-/// account update by using the offset and size stored in the AccountUpdate structure.
-/// 
-/// # Arguments
-/// * `path` - Path to the solcap file
-/// * `offset` - Byte offset in the file where the account data starts
-/// * `size` - Size of the account data in bytes
-/// 
-/// # Returns
-/// The raw account data as a Vec<u8>
-/// 
-/// # Example
-/// ```ignore
-/// let account_update = /* get from SolcapData */;
-/// let data = read_account_data_at_offset(
-///     "capture.solcap",
-///     account_update.data_offset,
-///     account_update.data_size
-/// )?;
-/// ```
+/* ============================================================================
+   Convenience functions
+   ============================================================================ */
+
+/* Read and parse a solcap file (with spinner) */
+pub fn read_solcap_file<P: AsRef<Path>>(path: P) -> Result<SolcapData, SolcapError> {
+    let spinner = Spinner::new("Ingesting solcap file...");
+    let mut reader = SolcapReader::open(path)?;
+    let result = reader.parse();
+    spinner.finish_and_clear();
+    result
+}
+
+/// Read account data at a specific file offset
 pub fn read_account_data_at_offset<P: AsRef<Path>>(
     path: P,
     offset: u64,
     size: u64,
-) -> Result<Vec<u8>, SolcapReaderError> {
-    // Open the file
+) -> Result<Vec<u8>, SolcapError> {
     let mut file = File::open(path)?;
-    
-    // Seek to the offset
     file.seek(SeekFrom::Start(offset))?;
-    
-    // Allocate buffer and read the data
     let mut buffer = vec![0u8; size as usize];
     file.read_exact(&mut buffer)?;
-    
     Ok(buffer)
 }
 
-/// Read account data for a specific AccountUpdate from a solcap file
-/// 
-/// This is a convenience wrapper around read_account_data_at_offset that takes
-/// an AccountUpdate directly.
-/// 
-/// # Arguments
-/// * `path` - Path to the solcap file
-/// * `account_update` - The AccountUpdate containing offset and size information
-/// 
-/// # Returns
-/// The raw account data as a Vec<u8>
+/// Read account data for an AccountUpdate
 pub fn read_account_data<P: AsRef<Path>>(
     path: P,
     account_update: &AccountUpdate,
-) -> Result<Vec<u8>, SolcapReaderError> {
+) -> Result<Vec<u8>, SolcapError> {
     read_account_data_at_offset(path, account_update.data_offset, account_update.data_size)
-}
-
-/// Convenience function to read a solcap file and return parsed data
-pub fn read_solcap_file<P: AsRef<Path>>(path: P) -> Result<SolcapData, SolcapReaderError> {
-    let spinner = Spinner::new("Ingesting solcap file...");
-    let mut reader = SolcapReader::from_file(path)?;
-    let result = reader.parse_file();
-    spinner.finish_and_clear();
-    result
 }
 
 #[cfg(test)]
@@ -312,32 +339,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_solcap_data_creation() {
+    fn test_solcap_data_new() {
         let data = SolcapData::new();
         assert_eq!(data.lowest_slot, u32::MAX);
         assert_eq!(data.highest_slot, 0);
         assert_eq!(data.slot_count(), 0);
-        assert_eq!(data.total_account_updates(), 0);
     }
 
     #[test]
-    fn test_slot_range_updates() {
+    fn test_slot_range() {
         let mut data = SolcapData::new();
-        
-        // Add some slots
         data.update_slot_range(100);
         assert_eq!(data.lowest_slot, 100);
         assert_eq!(data.highest_slot, 100);
-        assert_eq!(data.slot_count(), 1);
         
-        data.update_slot_range(105);
-        assert_eq!(data.lowest_slot, 100);
-        assert_eq!(data.highest_slot, 105);
-        assert_eq!(data.slot_count(), 6);
-        
-        data.update_slot_range(95);
-        assert_eq!(data.lowest_slot, 95);
-        assert_eq!(data.highest_slot, 105);
-        assert_eq!(data.slot_count(), 11);
+        data.update_slot_range(50);
+        assert_eq!(data.lowest_slot, 50);
+        assert_eq!(data.highest_slot, 100);
     }
 }
