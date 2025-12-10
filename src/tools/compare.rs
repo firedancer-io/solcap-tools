@@ -92,10 +92,10 @@ impl<T: Clone> CircularCache<T> {
     fn insert(&mut self, key: String, value: T) {
         /* Remove if already exists */
         self.items.retain(|(k, _)| k != &key);
-        
+
         /* Add new item */
         self.items.push_front((key, value));
-        
+
         /* Trim if over capacity */
         if self.items.len() > self.capacity {
             self.items.pop_back();
@@ -117,18 +117,21 @@ struct App {
     should_quit: bool,
     page_size: usize,
     hex_scroll_offset: usize,
-    
+
     /* Saved selection positions for navigation */
     saved_slot_selection: Option<usize>,
     saved_account_selection: Option<usize>,
-    
+
     /* Circular caches */
     account_cache: CircularCache<Vec<AccountInfo>>,
     update_cache: CircularCache<Vec<UpdateComparison>>,
     data_cache: CircularCache<(Option<Vec<u8>>, Option<Vec<u8>>)>,
-    
+
     current_cached_slot: Option<u32>,
     current_cached_account: Option<[u8; 32]>,
+
+    /* Options */
+    data_comp: bool, /* Whether to compare actual account data bytes */
 }
 
 /// Extract display name from a path (file name or folder name)
@@ -140,45 +143,65 @@ fn get_display_name(path: &Path) -> String {
 }
 
 impl App {
-    fn new(data1: SolcapData, data2: SolcapData, path1: PathBuf, path2: PathBuf) -> Self {
+    fn new(data1: SolcapData, data2: SolcapData, path1: PathBuf, path2: PathBuf, start_slot: Option<u32>, end_slot: Option<u32>, data_comp: bool) -> Self {
         /* Get display names from paths */
         let name1 = get_display_name(&path1);
         let name2 = get_display_name(&path2);
-        
+
         /* Build slot info list */
         let mut slot_set = HashSet::new();
-        
-        /* Collect all slots from both sources */
+
+        /* Collect all slots from both sources - include slots with account updates */
         for slot in data1.slot_account_updates_final.keys() {
             slot_set.insert(*slot);
         }
         for slot in data2.slot_account_updates_final.keys() {
             slot_set.insert(*slot);
         }
-        
-        /* Convert to sorted vec with metadata */
-        let mut slots: Vec<SlotInfo> = slot_set.into_iter().map(|slot| {
+
+        /* Also include slots that have bank preimages (even if no account updates) */
+        if data1.lowest_slot <= data1.highest_slot {
+            for slot in data1.lowest_slot..=data1.highest_slot {
+                if data1.get_bank_preimage(slot).is_some() {
+                    slot_set.insert(slot);
+                }
+            }
+        }
+        if data2.lowest_slot <= data2.highest_slot {
+            for slot in data2.lowest_slot..=data2.highest_slot {
+                if data2.get_bank_preimage(slot).is_some() {
+                    slot_set.insert(slot);
+                }
+            }
+        }
+
+        /* Convert to sorted vec with metadata, filtering by slot range */
+        let mut slots: Vec<SlotInfo> = slot_set.into_iter()
+            .filter(|slot| {
+                start_slot.map_or(true, |st| *slot >= st) && end_slot.map_or(true, |en| *slot <= en)
+            })
+            .map(|slot| {
             let preimage1 = data1.get_bank_preimage(slot);
             let preimage2 = data2.get_bank_preimage(slot);
-            
+
             let bank_hash_1 = preimage1.map(|p| p.bank_hash.hash);
             let bank_hash_2 = preimage2.map(|p| p.bank_hash.hash);
-            
+
             let account_count_1 = data1.get_account_updates_final(slot).map(|u| u.len()).unwrap_or(0);
             let account_count_2 = data2.get_account_updates_final(slot).map(|u| u.len()).unwrap_or(0);
-            
+
             let source = match (preimage1.is_some() || account_count_1 > 0, preimage2.is_some() || account_count_2 > 0) {
                 (true, true) => Source::Both,
                 (true, false) => Source::SourceOne,
                 (false, true) => Source::SourceTwo,
                 (false, false) => Source::Both, /* Shouldn't happen */
             };
-            
+
             let has_diff = match (bank_hash_1, bank_hash_2) {
                 (Some(h1), Some(h2)) => h1 != h2,
                 _ => source != Source::Both,
             };
-            
+
             SlotInfo {
                 slot,
                 bank_hash_1,
@@ -189,7 +212,7 @@ impl App {
                 has_diff,
             }
         }).collect();
-        
+
         slots.sort_by_key(|s| s.slot);
 
         let mut list_state = ListState::default();
@@ -217,6 +240,7 @@ impl App {
             data_cache: CircularCache::new(10),
             current_cached_slot: None,
             current_cached_account: None,
+            data_comp,
         }
     }
 
@@ -399,14 +423,14 @@ impl App {
 
     fn cache_accounts(&mut self, slot: u32) {
         let cache_key = format!("slot_{}", slot);
-        
+
         /* Check if already cached */
         if self.account_cache.get(&cache_key).is_some() {
             return;
         }
 
         let mut account_set = HashSet::new();
-        
+
         /* Collect accounts from both sources */
         if let Some(updates) = self.data1.get_account_updates_final(slot) {
             for key in updates.keys() {
@@ -418,39 +442,62 @@ impl App {
                 account_set.insert(*key);
             }
         }
-        
+
         /* Convert to sorted vec with metadata */
         let mut accounts: Vec<AccountInfo> = account_set.into_iter().map(|account| {
             let updates1 = self.data1.get_account_updates_final(slot)
                 .and_then(|u| u.get(&account));
             let updates2 = self.data2.get_account_updates_final(slot)
                 .and_then(|u| u.get(&account));
-            
+
             let update_count_1 = self.data1.get_account_updates_all(slot)
                 .map(|u| u.iter().filter(|up| &up.key.key == &account).count())
                 .unwrap_or(0);
             let update_count_2 = self.data2.get_account_updates_all(slot)
                 .map(|u| u.iter().filter(|up| &up.key.key == &account).count())
                 .unwrap_or(0);
-            
+
             let source = match (updates1.is_some(), updates2.is_some()) {
                 (true, true) => Source::Both,
                 (true, false) => Source::SourceOne,
                 (false, true) => Source::SourceTwo,
                 (false, false) => Source::Both, /* Shouldn't happen */
             };
-            
+
             /* Check if there's a difference in final values */
             let has_diff = match (updates1, updates2) {
                 (Some(u1), Some(u2)) => {
-                    u1.meta.lamports != u2.meta.lamports ||
-                    u1.data_size != u2.data_size ||
-                    u1.meta.owner.key != u2.meta.owner.key ||
-                    u1.meta.executable != u2.meta.executable
+                    /* Check metadata differences */
+                    let metadata_diff = u1.meta.lamports != u2.meta.lamports ||
+                        u1.data_size != u2.data_size ||
+                        u1.meta.owner.key != u2.meta.owner.key ||
+                        u1.meta.executable != u2.meta.executable;
+
+                    /* If metadata matches and data_comp is enabled, check actual account data bytes */
+                    if !metadata_diff && self.data_comp && u1.data_size > 0 && u2.data_size > 0 && u1.data_size == u2.data_size {
+                        /* Compare account data bytes */
+                        let data1 = if u1.file.is_some() {
+                            read_account_data_from_bhd(u1).ok()
+                        } else {
+                            read_account_data(&self.path1, u1).ok()
+                        };
+                        let data2 = if u2.file.is_some() {
+                            read_account_data_from_bhd(u2).ok()
+                        } else {
+                            read_account_data(&self.path2, u2).ok()
+                        };
+
+                        match (data1, data2) {
+                            (Some(d1), Some(d2)) => d1 != d2,
+                            _ => false, /* If we can't read data, assume no diff (metadata already matched) */
+                        }
+                    } else {
+                        metadata_diff
+                    }
                 }
                 _ => source != Source::Both,
             };
-            
+
             AccountInfo {
                 account,
                 update_count_1,
@@ -459,7 +506,7 @@ impl App {
                 has_diff,
             }
         }).collect();
-        
+
         /* Sort: differences first, then by base58 address */
         accounts.sort_by(|a, b| {
             /* First sort by has_diff (true comes before false) */
@@ -474,14 +521,14 @@ impl App {
                 }
             }
         });
-        
+
         self.account_cache.insert(cache_key, accounts);
         self.current_cached_slot = Some(slot);
     }
 
     fn cache_updates(&mut self, slot: u32, account: &[u8; 32]) {
         let cache_key = format!("slot_{}_account_{}", slot, bs58::encode(account).into_string());
-        
+
         /* Check if already cached */
         if self.update_cache.get(&cache_key).is_some() {
             return;
@@ -492,7 +539,42 @@ impl App {
             .and_then(|u| u.get(account));
         let update2 = self.data2.get_account_updates_final(slot)
             .and_then(|u| u.get(account));
-        
+
+        /* Check for differences including account data bytes if data_comp is enabled */
+        let has_diff = match (update1, update2) {
+            (Some(u1), Some(u2)) => {
+                /* Check metadata differences */
+                let metadata_diff = u1.meta.lamports != u2.meta.lamports ||
+                    u1.data_size != u2.data_size ||
+                    u1.meta.owner.key != u2.meta.owner.key ||
+                    u1.meta.executable != u2.meta.executable;
+
+                /* If metadata matches and data_comp is enabled, check actual account data bytes */
+                if !metadata_diff && self.data_comp && u1.data_size > 0 && u2.data_size > 0 && u1.data_size == u2.data_size {
+                    /* Compare account data bytes */
+                    let data1 = if u1.file.is_some() {
+                        read_account_data_from_bhd(u1).ok()
+                    } else {
+                        read_account_data(&self.path1, u1).ok()
+                    };
+                    let data2 = if u2.file.is_some() {
+                        read_account_data_from_bhd(u2).ok()
+                    } else {
+                        read_account_data(&self.path2, u2).ok()
+                    };
+
+                    match (data1, data2) {
+                        (Some(d1), Some(d2)) => d1 != d2,
+                        _ => false, /* If we can't read data, assume no diff (metadata already matched) */
+                    }
+                } else {
+                    metadata_diff
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        };
+
         let comparison = UpdateComparison {
             txn_idx_1: update1.and_then(|u| u.txn_idx),
             txn_idx_2: update2.and_then(|u| u.txn_idx),
@@ -502,28 +584,19 @@ impl App {
             owner_2: update2.map(|u| u.meta.owner.key),
             data_size_1: update1.map(|u| u.data_size),
             data_size_2: update2.map(|u| u.data_size),
-            has_diff: match (update1, update2) {
-                (Some(u1), Some(u2)) => {
-                    u1.meta.lamports != u2.meta.lamports ||
-                    u1.data_size != u2.data_size ||
-                    u1.meta.owner.key != u2.meta.owner.key ||
-                    u1.meta.executable != u2.meta.executable
-                }
-                (Some(_), None) | (None, Some(_)) => true,
-                (None, None) => false,
-            },
+            has_diff,
         };
-        
+
         self.update_cache.insert(cache_key, vec![comparison]);
         self.current_cached_account = Some(*account);
-        
+
         /* Also cache the actual account data for hex display */
         self.cache_account_data(slot, account);
     }
 
     fn cache_account_data(&mut self, slot: u32, account: &[u8; 32]) {
         let cache_key = format!("data_slot_{}_account_{}", slot, bs58::encode(account).into_string());
-        
+
         /* Check if already cached */
         if self.data_cache.get(&cache_key).is_some() {
             return;
@@ -534,7 +607,7 @@ impl App {
             .and_then(|u| u.get(account));
         let update2 = self.data2.get_account_updates_final(slot)
             .and_then(|u| u.get(account));
-        
+
         /* Read data from both sources */
         let data1 = update1.and_then(|u| {
             if u.file.is_some() {
@@ -543,7 +616,7 @@ impl App {
                 read_account_data(&self.path1, u).ok()
             }
         });
-        
+
         let data2 = update2.and_then(|u| {
             if u.file.is_some() {
                 read_account_data_from_bhd(u).ok()
@@ -551,7 +624,7 @@ impl App {
                 read_account_data(&self.path2, u).ok()
             }
         });
-        
+
         self.data_cache.insert(cache_key, (data1, data2));
     }
 }
@@ -685,7 +758,7 @@ fn render_account_level(f: &mut Frame, app: &mut App, slot: u32, area: Rect) {
         "ACCOUNT                                       │ ({}) │ ({})",
         name1_short, name2_short
     );
-    
+
     let cache_key = format!("slot_{}", slot);
     let items: Vec<ListItem> = if let Some(accounts) = app.account_cache.get(&cache_key) {
         accounts.iter().map(|acc_info| {
@@ -741,14 +814,14 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
 
     /* Get cached update comparison */
     let cache_key = format!("slot_{}_account_{}", slot, bs58::encode(account).into_string());
-    
+
     let update_info = if let Some(comparisons) = app.update_cache.get(&cache_key) {
         if let Some(comp) = comparisons.first() {
             let mut lines = vec![
                 Line::from(Span::styled("Comparison of Final Account States", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
                 Line::from(""),
             ];
-            
+
             /* Transaction indices */
             let txn_color = if comp.has_diff { Color::Red } else { Color::Green };
             lines.push(Line::from(vec![
@@ -763,7 +836,7 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
                     Style::default().fg(if comp.txn_idx_2.is_some() { txn_color } else { Color::DarkGray })
                 ),
             ]));
-            
+
             /* Lamports */
             let lamp_diff = match (comp.lamports_1, comp.lamports_2) {
                 (Some(l1), Some(l2)) => l1 != l2,
@@ -781,7 +854,7 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
                     Style::default().fg(if lamp_diff && comp.lamports_2.is_some() { Color::Red } else if comp.lamports_2.is_some() { Color::Green } else { Color::DarkGray })
                 ),
             ]));
-            
+
             /* Owner */
             let owner_diff = match (comp.owner_1, comp.owner_2) {
                 (Some(o1), Some(o2)) => o1 != o2,
@@ -799,7 +872,7 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
                     Style::default().fg(if owner_diff && comp.owner_2.is_some() { Color::Red } else if comp.owner_2.is_some() { Color::Cyan } else { Color::DarkGray })
                 ),
             ]));
-            
+
             /* Data size */
             let data_diff = match (comp.data_size_1, comp.data_size_2) {
                 (Some(d1), Some(d2)) => d1 != d2,
@@ -817,7 +890,7 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
                     Style::default().fg(if data_diff && comp.data_size_2.is_some() { Color::Red } else if comp.data_size_2.is_some() { Color::Magenta } else { Color::DarkGray })
                 ),
             ]));
-            
+
             lines
         } else {
             vec![Line::from(Span::styled("No comparison data available", Style::default().fg(Color::Red)))]
@@ -836,7 +909,7 @@ fn render_update_level(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 3
 
 fn render_hex_dump_comparison(f: &mut Frame, app: &mut App, slot: u32, account: &[u8; 32], area: Rect) {
     let cache_key = format!("data_slot_{}_account_{}", slot, bs58::encode(account).into_string());
-    
+
     /* Split area into two columns */
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -872,7 +945,7 @@ fn render_hex_data_with_diff(
     _is_left: bool,
 ) -> Vec<Line<'static>> {
     let bytes_per_row = 16;
-    
+
     match data {
         None => vec![Line::from(Span::styled(
             "No data available",
@@ -886,14 +959,14 @@ fn render_hex_data_with_diff(
             let total_rows = (data.len() + bytes_per_row - 1) / bytes_per_row;
             let start_row = scroll_offset.min(total_rows.saturating_sub(1));
             let end_row = (start_row + visible_rows).min(total_rows);
-            
+
             let mut lines = Vec::new();
-            
+
             for row in start_row..end_row {
                 let offset = row * bytes_per_row;
                 let row_end = (offset + bytes_per_row).min(data.len());
                 let row_data = &data[offset..row_end];
-                
+
                 /* Build the line with colored spans for differences */
                 let mut spans = vec![
                     Span::styled(
@@ -901,12 +974,12 @@ fn render_hex_data_with_diff(
                         Style::default().fg(Color::DarkGray)
                     )
                 ];
-                
+
                 for (i, byte) in row_data.iter().enumerate() {
                     if i == 8 {
                         spans.push(Span::raw(" "));
                     }
-                    
+
                     /* Check if this byte differs from the other source */
                     let differs = if let Some(other) = other_data {
                         let other_idx = offset + i;
@@ -918,24 +991,24 @@ fn render_hex_data_with_diff(
                     } else {
                         false /* No other data to compare with */
                     };
-                    
+
                     let color = if differs { Color::Red } else { Color::White };
                     spans.push(Span::styled(
                         format!("{:02X} ", byte),
                         Style::default().fg(color)
                     ));
                 }
-                
+
                 lines.push(Line::from(spans));
             }
-            
+
             if end_row < total_rows {
                 lines.push(Line::from(Span::styled(
                     format!("... ({} more rows) ...", total_rows - end_row),
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
                 )));
             }
-            
+
             lines
         }
     }
@@ -996,6 +1069,9 @@ impl From<std::io::Error> for CompareError {
 pub fn compare_solcap<P1: AsRef<Path>, P2: AsRef<Path>>(
     path1: P1,
     path2: P2,
+    start_slot: Option<u32>,
+    end_slot: Option<u32>,
+    data_comp: bool,
 ) -> Result<(), CompareError> {
     let path1 = path1.as_ref();
     let path2 = path2.as_ref();
@@ -1027,7 +1103,7 @@ pub fn compare_solcap<P1: AsRef<Path>, P2: AsRef<Path>>(
     })?;
 
     /* Create app and run */
-    let mut app = App::new(data1, data2, path1.to_path_buf(), path2.to_path_buf());
+    let mut app = App::new(data1, data2, path1.to_path_buf(), path2.to_path_buf(), start_slot, end_slot, data_comp);
     let res = run_app(&mut terminal, &mut app);
 
     /* Restore terminal */

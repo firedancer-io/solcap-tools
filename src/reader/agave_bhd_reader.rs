@@ -54,7 +54,8 @@ pub struct AgaveBankHashDetailEntry {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgaveAccountEntry {
     pub pubkey: String,
-    pub hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>, /* Optional hash field - not present in all JSON formats */
     pub owner: String,
     pub lamports: u64,
     pub executable: bool,
@@ -91,34 +92,34 @@ impl AgaveBhdReader {
         /* Collect all JSON file paths first */
         let entries = fs::read_dir(&self.directory_path)?;
         let mut json_files = Vec::new();
-        
+
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            
+
             /* Only process .json files */
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 json_files.push(path);
             }
         }
-        
+
         if json_files.is_empty() {
             return Ok(SolcapData::new());
         }
-        
+
         /* Determine number of threads to use (cap at number of files or CPU count) */
         let num_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
             .min(json_files.len());
-        
+
         /* Split files into chunks for each thread */
         let chunk_size = (json_files.len() + num_threads - 1) / num_threads;
         let file_chunks: Vec<Vec<_>> = json_files
             .chunks(chunk_size)
             .map(|chunk| chunk.to_vec())
             .collect();
-        
+
         /* Process file chunks in parallel using scoped threads */
         let results = std::thread::scope(|s| {
             let handles: Vec<_> = file_chunks
@@ -135,19 +136,19 @@ impl AgaveBhdReader {
                     })
                 })
                 .collect();
-            
+
             /* Collect results from all threads */
             handles.into_iter()
                 .map(|h| h.join().unwrap())
                 .collect::<Vec<_>>()
         });
-        
+
         /* Merge all results */
         let mut final_data = SolcapData::new();
         for data in results {
             final_data.merge(data);
         }
-        
+
         Ok(final_data)
     }
 
@@ -289,16 +290,16 @@ impl AgaveBhdReader {
 }
 
 /// Read account data for a specific AccountUpdate from an Agave bank hash details file
-/// 
+///
 /// Since Agave bank hash details store account data as base64 encoded strings in JSON,
 /// this function reads the JSON file, finds the specific account, and decodes its data.
-/// 
+///
 /// # Arguments
 /// * `account_update` - The AccountUpdate containing the file path and account key
-/// 
+///
 /// # Returns
 /// The decoded account data as a Vec<u8>
-/// 
+///
 /// # Note
 /// This requires that the AccountUpdate has a file path set (which it should for Agave BHD)
 pub fn read_account_data_from_bhd(
@@ -310,14 +311,14 @@ pub fn read_account_data_from_bhd(
             "AccountUpdate does not have a file path set".to_string()
         )
     })?;
-    
+
     /* Read and parse the JSON file */
     let contents = fs::read_to_string(file_path)?;
     let bhd: AgaveBankHashDetails = serde_json::from_str(&contents)?;
-    
+
     /* Find the account in the file */
     let target_key = bs58::encode(&account_update.key.key).into_string();
-    
+
     for entry in bhd.bank_hash_details {
         if entry.slot == account_update.slot {
             for account in &entry.accounts {
@@ -335,7 +336,7 @@ pub fn read_account_data_from_bhd(
             }
         }
     }
-    
+
     Err(AgaveBhdReaderError::InvalidFormat(
         format!("Account not found in file: {}", target_key)
     ))
