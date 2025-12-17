@@ -104,6 +104,26 @@ fn main() {
                         .required(true)
                         .index(2),
                 )
+                .arg(
+                    Arg::new("start-slot")
+                        .long("start-slot")
+                        .value_name("SLOT")
+                        .help("Starting slot to compare (inclusive)")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("end-slot")
+                        .long("end-slot")
+                        .value_name("SLOT")
+                        .help("Ending slot to compare (inclusive)")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("data-comp")
+                        .long("data-comp")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Compare actual account data bytes (slower but more thorough)"),
+                )
         )
         .subcommand(
             Command::new("verify")
@@ -192,7 +212,10 @@ fn main() {
                 sub_matches.get_one::<String>("path1"),
                 sub_matches.get_one::<String>("path2"),
             ) {
-                if let Err(e) = compare_solcap(path1, path2) {
+                let start_slot = sub_matches.get_one::<u32>("start-slot").copied();
+                let end_slot = sub_matches.get_one::<u32>("end-slot").copied();
+                let data_comp = sub_matches.get_flag("data-comp");
+                if let Err(e) = compare_solcap(path1, path2, start_slot, end_slot, data_comp) {
                     eprintln!("Error: {:?}", e);
                     std::process::exit(1);
                 }
@@ -202,7 +225,7 @@ fn main() {
             if let Some(file) = sub_matches.get_one::<String>("file") {
                 let verbose = sub_matches.get_flag("verbose");
                 let output = sub_matches.get_one::<String>("output").cloned();
-                
+
                 match verify_solcap(file, verbose, output.as_ref()) {
                     Ok(stats) => {
                         if !verbose {
@@ -229,7 +252,7 @@ fn main() {
                 .collect();
             let output = sub_matches.get_one::<String>("output").cloned();
             let verbose = sub_matches.get_flag("verbose");
-            
+
             /* Expand directories to find .solcap files */
             let mut files = Vec::new();
             for path_str in input_args {
@@ -260,12 +283,12 @@ fn main() {
                     files.push(path_str);
                 }
             }
-            
+
             if files.is_empty() {
                 eprintln!("✗ No .solcap files found in the specified paths");
                 std::process::exit(1);
             }
-            
+
             match combine_solcap(&files, output, verbose) {
                 Ok(_stats) => {
                     std::process::exit(0);
