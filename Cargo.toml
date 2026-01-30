@@ -1,0 +1,33 @@
+[package]
+name = "solcap-tools"
+version = "0.1.0"
+edition = "2021"
+authors = ["Firedancer Team"]
+description = "Tools for analyzing and visualizing solcap files"
+
+[[bin]]
+name = "solcap-tools"
+path = "src/main.rs"
+
+[lib]
+name = "solcap_tools"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+bs58 = "0.5"
+hex = "0.4"
+pcap-parser = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+indicatif = "0.17"
+ratatui = "0.26"
+crossterm = "0.27"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
